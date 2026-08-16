@@ -1,0 +1,17 @@
+name: staffing
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - streamlit
+  - pandas
+  - numpy
+  - scikit-learn
+  - scipy
+  - statsmodels
+  - prophet
+  - pymc
+  - arviz
+  - holidays
+  - xgboost
+  - plotly
