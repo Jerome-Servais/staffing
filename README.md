@@ -1,262 +1,142 @@
-# 📞 Prévision du volume d'appels & recommandation de staffing
+# Prévision d'appels et staffing
 
-Prototype Streamlit pour prévoir le nombre d'appels entrants par date et
-tranche horaire, valider l'hypothèse de Poisson, comparer plusieurs modèles
-de prévision (dont un modèle bayésien) et en déduire un nombre d'agents
-recommandé.
+Application Streamlit qui prévoit le volume d'appels d'un centre de contact par
+tranche horaire, puis calcule le nombre d'agents nécessaire pour tenir un objectif
+de service, avec la loi d'Erlang C.
 
-## Sommaire
+Prototype réalisé seul dans le cadre de mon projet de fin d'études (Mastère IA &
+Management, IA School, 2026). Il complète [Taux_appel](https://github.com/Jerome-Servais/Taux_appel),
+qui suit et explique les sollicitations par profil de client : ici, on anticipe la
+charge pour dimensionner l'équipe.
 
-- [Installation](#installation)
-- [Lancement](#lancement)
-- [Format du fichier CSV attendu](#format-du-fichier-csv-attendu)
-- [Les 5 pages de l'application](#les-5-pages-de-lapplication)
-- [Architecture du code](#architecture-du-code)
-- [Les modèles de prévision](#les-modèles-de-prévision)
-- [Comment interpréter les métriques](#comment-interpréter-les-métriques)
-- [La formule de staffing](#la-formule-de-staffing)
-- [Limites connues et pistes d'amélioration](#limites-connues-et-pistes-damélioration)
-- [Réponses aux questions posées](#réponses-aux-questions-posées)
+Les données d'exemple sont **synthétiques** : les résultats ci-dessous décrivent le
+comportement de la méthode, pas celui d'un centre d'appels réel.
 
----
+![Planning recommandé par tranche et contrôle par simulation](docs/staffing.png)
 
-## Installation
+## Résultats
 
-```bash
-python -m venv venv
-source venv/bin/activate   # Windows : venv\Scripts\activate
-pip install -r requirements.txt
-```
+Reproductibles avec `python evaluate.py --datasets 5 --runs 20 --all-models`.
 
-> **Note Prophet/PyMC** : ces deux librairies compilent un backend au premier
-> usage (cmdstanpy pour Prophet, PyTensor pour PyMC). La première exécution
-> de l'application peut donc être un peu plus lente que les suivantes.
+### Le planning recommandé tient l'objectif
+
+Le modèle apprend sur 12 semaines, recommande un planning, puis ce planning est
+confronté à 4 nouvelles semaines simulées (20 répétitions), avec abandons et écarts
+de vitesse entre agents. Objectif : 80 % des appels pris en moins de 20 s.
+
+| Planning | Niveau de service | Pire tranche ouvrée | Abandons | Attente moyenne | Heures-agent / semaine |
+|---|---:|---:|---:|---:|---:|
+| D'origine | 71,1 % | 44,9 % | 15,5 % | 15,9 s | 126 |
+| Recommandé | 92,0 % | 83,8 % | 3,4 % | 3,8 s | 185 |
+
+Tenir l'objectif sur chaque tranche coûte 47 % d'heures-agent en plus. Le service
+global dépasse l'objectif parce que l'effectif est un nombre entier et que le volume
+par tranche est faible : un agent de plus a beaucoup d'effet.
+
+### La prévision atteint presque la limite du hasard
+
+Même en connaissant le vrai rythme d'appels, un modèle ne peut pas prévoir le hasard
+d'un comptage. Cette limite sert de référence (5 jeux de données, 3 replis de 14 jours).
+
+| Modèle | RMSE | WAPE | R² | Couverture IC 95 % |
+|---|---:|---:|---:|---:|
+| **Limite (vrai rythme connu)** | **3,26** | **23,4 %** | **0,76** | 97,1 % |
+| Régression de Poisson (GLM) | 3,33 | 23,8 % | 0,75 | 96,8 % |
+| Poisson bayésien (PyMC) | 3,33 | 23,8 % | 0,75 | 96,9 % |
+| Prophet | 3,46 | 24,6 % | 0,74 | 89,7 % |
+| Régression linéaire | 3,54 | 26,2 % | 0,72 | 90,3 % |
+| SARIMA | 3,58 | 25,4 % | 0,72 | 92,2 % |
+| XGBoost (Poisson) | 3,60 | 25,8 % | 0,71 | 95,4 % |
+| Référence (moyenne 4 semaines) | 3,63 | 25,9 % | 0,71 | 94,6 % |
+
+Par tranche horaire, le WAPE reste élevé car chaque tranche compte peu d'appels. Sur
+le total de la journée, celui qui sert à planifier une équipe, il est de 8,3 % pour le
+GLM, contre 7,6 % à la limite. Deux modèles restent sous la couverture visée de 95 % :
+Prophet et la régression linéaire sont un peu trop confiants.
+
+Le GLM est retenu par défaut : aussi précis que le modèle bayésien et bien plus
+rapide. Le générateur favorise ce modèle, car l'effet du jour y multiplie exactement
+celui de l'heure : sur des données réelles, il faudrait refaire cette comparaison.
 
 ## Lancement
 
+Testé avec Python 3.12.
+
 ```bash
+python -m venv venv
+source venv/bin/activate      # Windows : venv\Scripts\activate
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Au premier lancement, aucune donnée n'est chargée. Deux options :
+L'application s'ouvre sur `exemple_donnees_appels.csv`. Pour lancer les tests et
+reproduire l'évaluation (environ 3 minutes) :
 
-1. **Importer un fichier CSV** (vos données réelles) via la barre latérale.
-2. **Aller sur la page "Données synthétiques"**, cliquer sur "🎲 Générer les
-   données", puis sur "✅ Utiliser ces données dans l'application" — pratique
-   pour explorer l'outil sans données réelles.
+```bash
+pip install -r requirements-dev.txt
+pytest
+python evaluate.py --datasets 5 --runs 20 --all-models
+```
 
-Un exemple de fichier est fourni : **`exemple_donnees_appels.csv`**
-(générée avec `data_generator.py`, ~10 500 appels sur 3 mois, 5 agents).
+## Pages
 
-## Format du fichier CSV attendu
+1. **Exploration** : niveau de service, abandons, DMT, attente, volume par tranche.
+2. **Validation de Poisson** : test de dispersion global et détail par tranche.
+3. **Prévision** : comparaison par validation glissante, face à la limite théorique.
+
+   ![Comparaison des modèles face à la limite théorique](docs/prevision.png)
+
+4. **Staffing** : planning recommandé et contrôle par simulation de la tranche la plus chargée.
+5. **Données synthétiques** : génération d'un nouveau jeu de données.
+
+## Format du CSV
 
 | Colonne | Description |
 |---|---|
-| `id_appel` | Identifiant unique de l'appel |
-| `date_heure` | Date et heure de l'appel (ex : `2026-01-15 09:23:11`) |
+| `id_appel` | Identifiant unique |
+| `date_heure` | Ex. `2026-01-15 09:23:11` |
 | `statut` | `repondu` ou `non_repondu` |
-| `post_appel` | Temps de post-appel, en secondes |
-| `temps_communication` | Durée de la conversation, en secondes |
-| `temps_attente` | Temps d'attente avant prise d'appel, en secondes |
-| `id_agent` | Identifiant de l'agent (vide si `non_repondu`) |
+| `post_appel` | Post-appel, en secondes |
+| `temps_communication` | Conversation, en secondes |
+| `temps_attente` | Attente avant prise d'appel ou abandon, en secondes |
+| `id_agent` | Agent, vide si `non_repondu` |
 
-Si des colonnes sont manquantes ou si des dates sont illisibles,
-l'application vous l'indique précisément dans la barre latérale (sans
-planter) et vous invite à corriger le fichier.
+## Méthode
 
-## Les 5 pages de l'application
+- **Indicateurs** : le niveau de service mesure la part des appels pris dans le délai,
+  le taux d'abandon celle des appelants qui raccrochent. La DMT additionne
+  communication et post-appel, sans l'attente.
+- **Tranches sans appel** : elles restent dans les données avec un volume de 0. Les
+  retirer gonflerait les moyennes.
+- **Prévision** : le modèle est réentraîné à chaque repli et ne voit jamais de données
+  futures. Les intervalles portent sur le volume observé, pas seulement sur sa moyenne.
+- **Poisson** : le test de dispersion regroupe toutes les tranches. Sur 13 semaines,
+  une tranche isolée n'a pas assez d'observations pour conclure.
+- **Staffing** : on retient le plus petit effectif qui respecte le niveau de service
+  et l'occupation maximale, puis une simulation contrôle la tranche la plus chargée.
+- **Données synthétiques** : les appels traversent une vraie file d'attente. L'attente
+  dépend donc de la charge et du planning, sinon le staffing ne serait pas vérifiable.
 
-1. **Exploration des données** — heatmap du volume par date/tranche, courbe
-   de DMT par agent, attente moyenne par tranche, taux de décroché par jour,
-   table détaillée exportable.
-2. **Validation de Poisson** — explications accessibles, comparaison
-   histogramme observé vs courbe de Poisson théorique, test du Chi², tableau
-   moyenne/variance par jour et tranche.
-3. **Prédiction et comparaison** — sélection des modèles, découpage
-   entraînement/test, tableau de métriques, courbe prédiction vs réel avec
-   intervalle de confiance pour les modèles probabilistes.
-4. **Recommandation de staffing** — choix du modèle et de l'horizon de
-   prévision, sliders de seuils de qualité de service, tableau de
-   recommandation, heatmap des agents recommandés, export CSV.
-5. **Données synthétiques** — génère un jeu de données réaliste pour tester
-   l'application, avec export CSV et chargement direct dans l'app.
-
-## Architecture du code
+## Architecture
 
 ```
-app.py            # Application Streamlit (orchestration des 5 pages)
-models.py         # Les 6 modèles de prévision + métriques + staffing
-utils.py          # Prétraitement, agrégation, validation de Poisson
-data_generator.py # Génération de données synthétiques réalistes
-requirements.txt
-exemple_donnees_appels.csv
+app.py             interface Streamlit
+utils.py           chargement, agrégation, indicateurs, tests de dispersion
+models.py          modèles de prévision, métriques, validation glissante
+staffing.py        Erlang C, recommandation, simulation de file d'attente
+data_generator.py  données synthétiques
+evaluate.py        évaluation reproductible
+tests/             tests unitaires
 ```
 
-### Ajouter un nouveau modèle (conçu pour être simple)
+Pour ajouter un modèle, créez une classe héritant de `BaseForecastModel` puis
+ajoutez-la à `MODEL_REGISTRY` : l'application la propose automatiquement.
 
-Tous les modèles héritent de `BaseForecastModel` (dans `models.py`) et
-implémentent seulement deux méthodes :
+## Limites
 
-```python
-class MonNouveauModele(BaseForecastModel):
-    name = "Mon nouveau modèle"
-    is_bayesian = False
-    description = "..."
-
-    def _fit(self, train_df):
-        # entraîner le modèle sur train_df (colonnes : date, heure_debut,
-        # jour_semaine, jour_semaine_num, volume, ...)
-        ...
-
-    def _predict(self, future_df, extra_history=None):
-        # retourner un ForecastResult(pred_mean, pred_lower, pred_upper)
-        ...
-```
-
-Puis l'ajouter au dictionnaire `MODEL_REGISTRY` en bas de `models.py` :
-
-```python
-MODEL_REGISTRY["Mon nouveau modèle"] = MonNouveauModele
-```
-
-**C'est tout** : `app.py` n'a rien à modifier, le nouveau modèle apparaît
-automatiquement dans les pages "Prédiction" et "Staffing".
-
-## Les modèles de prévision
-
-| Modèle | Type | Avantages | Inconvénients |
-|---|---|---|---|
-| **Régression linéaire** | Classique | Rapide, très interprétable | Peut prédire des valeurs négatives, relation supposée linéaire |
-| **SARIMA** *(par tranche)* | Classique, séries temporelles | Capture bien tendance + saisonnalité hebdo si l'historique est long | Un modèle par tranche horaire ; plus lent ; sensible à un historique court |
-| **Prophet** *(par tranche)* | Classique, séries temporelles | Robuste aux données manquantes, intervalle natif | Un modèle par tranche horaire ; peut sur-ajuster sur historique court (voir note ci-dessous) |
-| **XGBoost (objectif Poisson)** | Machine learning | Capture des interactions non linéaires, bonnes performances | Moins interprétable, intervalle approximatif |
-| **Régression de Poisson (GLM)** | Probabiliste, fréquentiste | Adaptée aux comptages, rapide, intervalle de confiance natif | L'intervalle ne porte que sur la moyenne, pas sur la variabilité réelle du comptage |
-| **Poisson bayésien (PyMC)** | Probabiliste, bayésien | Intervalle de **prédiction** complet (paramètres + variabilité du comptage) ; répond à "quelle est la probabilité que le volume soit dans telle fourchette ?" | Le plus coûteux en temps de calcul (échantillonnage MCMC, ~10-20 secondes) |
-
-> **Note technique** — SARIMA et Prophet sont conçus pour une **série
-> temporelle unique** (une valeur par pas de temps). Comme nos données ont
-> plusieurs tranches horaires par jour, un modèle séparé est entraîné **par
-> tranche horaire**, sur la série quotidienne de cette tranche (saisonnalité
-> hebdomadaire, période = 7 jours). Les modèles tabulaires (régression
-> linéaire, XGBoost, GLM Poisson, Poisson bayésien), eux, utilisent une seule
-> matrice de features avec le jour de la semaine et la tranche horaire en
-> indicatrices (one-hot), ce qui leur permet de modéliser toutes les tranches
-> à la fois.
-
-### Le modèle bayésien, en clair
-
-Un modèle bayésien ne donne pas une seule prédiction : il donne une
-**distribution de prédictions possibles**. Concrètement :
-
-- Le modèle est entraîné en estimant, pour chaque paramètre, non pas une
-  valeur unique mais une distribution de valeurs plausibles compte tenu des
-  données observées (échantillonnage MCMC, ici via PyMC/NUTS).
-- Pour prédire le volume d'une tranche future, on combine ces distributions
-  de paramètres avec la variabilité naturelle du comptage (loi de Poisson)
-  pour obtenir, par exemple : *"on prévoit 50 appels, avec 95% de chances
-  que le volume réel soit entre 40 et 60"*.
-- Plus l'historique est riche et stable, plus cet intervalle se resserre.
-
-### Exemple de code : régression de Poisson bayésienne (extrait de `models.py`)
-
-```python
-import pymc as pm
-
-with pm.Model() as model:
-    intercept = pm.Normal("intercept", mu=np.log(max(y.mean(), 1)), sigma=1.0)
-    betas = pm.Normal("betas", mu=0.0, sigma=0.5, shape=n_features)
-    eta = intercept + pm.math.dot(X_scaled, betas)
-    mu = pm.math.exp(eta)
-    pm.Poisson("y_obs", mu=mu, observed=y)
-
-    trace = pm.sample(draws=600, tune=600, chains=2, target_accept=0.9)
-```
-
-Pour la prédiction, on calcule `mu` pour chaque tirage postérieur des
-coefficients, puis on tire un comptage de Poisson pour chacun — cela donne
-la distribution prédictive complète (voir `BayesianPoissonModel._predict`
-dans `models.py`).
-
-## Comment interpréter les métriques
-
-- **RMSE / MAE** : erreur moyenne, en nombre d'appels (plus petit = mieux).
-- **MAPE (%)** : erreur moyenne en pourcentage du volume réel.
-- **R²** : part de la variation du volume expliquée par le modèle (proche
-  de 1 = mieux).
-- **Couverture IC95% (%)** : pourcentage des vraies valeurs effectivement
-  comprises dans l'intervalle prédit à 95% — on vise ~95%.
-- **Largeur moyenne IC** : largeur moyenne de l'intervalle ; à couverture
-  égale, plus étroit = plus informatif.
-
-## La formule de staffing
-
-```
-agents_base = CEIL( (volume_prédit × DMT_moyenne) / durée_tranche )
-```
-
-Puis on augmente progressivement le nombre d'agents tant que :
-
-```
-attente_estimée(N)  = attente_historique × (agents_base / N)  >  seuil_attente
-   OU
-décroché_estimé(N)  = décroché_historique × (agents_base / N)  >  seuil_décroché
-```
-
-jusqu'à respecter les deux seuils ou atteindre le maximum d'agents
-disponibles (un avertissement est alors affiché).
-
-> Cette approximation (linéaire) est volontairement simple. Une
-> modélisation plus rigoureuse de l'effet du nombre d'agents sur l'attente
-> utiliserait la **loi d'Erlang C** (théorie des files d'attente), qui sort
-> du cadre de ce prototype mais constitue une piste d'amélioration naturelle.
-
-## Limites connues et pistes d'amélioration
-
-- Le staffing utilise une approximation linéaire plutôt qu'un modèle de
-  file d'attente (Erlang C).
-- SARIMA/Prophet par tranche horaire suppose un historique journalier
-  suffisant par tranche (idéalement plusieurs mois) ; en deçà, l'application
-  retombe sur une moyenne globale pour les tranches sans modèle valide.
-- Le modèle bayésien est sensible au nombre d'itérations MCMC (`draws`,
-  `tune` dans `BayesianPoissonModel.__init__`) : les valeurs par défaut
-  privilégient la rapidité (quelques secondes) sur la précision parfaite des
-  diagnostics de convergence (rhat). Pour un usage en production, augmenter
-  `draws`/`tune`/`chains`.
-- La DMT et la qualité de service futures sont estimées par moyenne
-  historique (par jour de semaine + tranche), pas par un modèle prédictif
-  dédié — cohérent avec la demande initiale, mais pourrait être affiné.
-
----
-
-## Réponses aux questions posées
-
-**1. Quels modèles proposes-tu, avantages/inconvénients ?**
-Voir le tableau dans [Les modèles de prévision](#les-modèles-de-prévision).
-
-**2. Comment implémenter le test de Poisson de manière claire et visuelle ?**
-Page "Validation de Poisson" : histogramme observé superposé à la courbe
-théorique de Poisson(λ), tableau moyenne/variance, test du Chi² avec
-message en français (`utils.poisson_chi2_test`, `utils.poisson_validation_report`).
-
-**3. Comment calculer le taux de décroché ?**
-`utils.aggregate_by_slot` : un appel est compté "décroché" (non satisfaisant)
-s'il est `non_repondu`, OU `repondu` avec un `temps_attente` supérieur au
-seuil choisi dans la barre latérale.
-
-**4. Exemples de code (Poisson bayésien + intervalles de confiance) ?**
-Voir [Le modèle bayésien, en clair](#le-modèle-bayésien-en-clair) ci-dessus
-et la classe `BayesianPoissonModel` dans `models.py`.
-
-**5. Comment structurer le code pour une extension modulaire ?**
-Voir [Ajouter un nouveau modèle](#ajouter-un-nouveau-modèle-conçu-pour-être-simple) :
-interface commune `BaseForecastModel` + dictionnaire `MODEL_REGISTRY`.
-
-**6. Comment générer des données synthétiques réalistes ?**
-`data_generator.generate_synthetic_calls` : volume via processus de Poisson
-(profils jour/heure configurables), attente via loi exponentielle, DMT par
-agent avec compétence individuelle + courbe d'apprentissage progressive.
-
----
-
-*Prototype développé avec Streamlit, pandas, scikit-learn, statsmodels,
-Prophet, XGBoost et PyMC.*
+- Erlang C ignore les abandons et ne tient pas compte des pauses ni des absences. Un
+  planning réel doit ajouter ce temps non disponible.
+- La prévision ne couvre que des effets récurrents. Une campagne ou un changement
+  réglementaire demande une information externe.
+- Trois mois d'historique ne permettent pas d'estimer une saisonnalité annuelle.
+- Le comportement de patience des appelants est une hypothèse du simulateur.

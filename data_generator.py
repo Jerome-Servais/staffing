@@ -1,29 +1,28 @@
 """
 data_generator.py
-==================
-Generation de donnees synthetiques realistes pour demontrer l'application
-sans avoir besoin de donnees reelles (page "Donnees synthetiques").
+=================
+Données synthétiques réalistes, pour utiliser l'application sans données réelles.
 
-Logique :
-    - Le volume d'appels par tranche horaire suit un processus de Poisson
-      dont le lambda varie par jour de la semaine et par heure (profil
-      d'activite plus fort en matinee/debut d'apres-midi, plus faible le
-      week-end).
-    - Les horodatages individuels des appels sont tires uniformement dans
-      chaque tranche.
-    - Le temps d'attente suit une loi exponentielle (modele classique de
-      files d'attente), tronquee pour eviter des valeurs extremes.
-    - La DMT (post-appel + communication) varie par agent, avec une
-      tendance a l'amelioration progressive dans le temps (apprentissage).
+Les appels traversent une véritable file d'attente : l'attente résulte du volume
+reçu et du nombre d'agents en poste, comme dans un centre d'appels. Sans ce lien,
+aucune recommandation de staffing ne pourrait être vérifiée.
+
+    - Volume : processus de Poisson, dont l'intensité dépend du jour et de l'heure.
+    - Planning : effectif fixe par heure, calé sur un jour de semaine moyen. Le
+      lundi est donc tendu et le week-end largement couvert.
+    - Abandons : chaque appelant a une patience aléatoire et raccroche au-delà.
+    - DMT : varie selon l'agent et baisse au fil du temps (apprentissage).
 """
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
+from staffing import simulate_fcfs
 from utils import STATUT_NON_REPONDU, STATUT_REPONDU
 
 
@@ -33,7 +32,7 @@ DEFAULT_HOURLY_PROFILE = {
 }
 
 DEFAULT_WEEKDAY_PROFILE = {
-    0: 1.1,   # lundi : pic d'appels frequent
+    0: 1.1,   # lundi : jour le plus chargé
     1: 1.0,
     2: 0.95,
     3: 0.95,
@@ -43,6 +42,38 @@ DEFAULT_WEEKDAY_PROFILE = {
 }
 
 
+def true_call_rate(
+    weekday: int,
+    hour: int,
+    base_lambda: float = 18.0,
+    hourly_profile: Optional[dict] = None,
+    weekday_profile: Optional[dict] = None,
+) -> float:
+    """Vraie intensité horaire du générateur, utile pour évaluer les modèles."""
+    hourly_profile = hourly_profile or DEFAULT_HOURLY_PROFILE
+    weekday_profile = weekday_profile or DEFAULT_WEEKDAY_PROFILE
+    if hour not in hourly_profile:
+        return 0.0
+    return max(base_lambda * hourly_profile[hour] * weekday_profile.get(weekday, 1.0), 0.05)
+
+
+def build_schedule(
+    hourly_profile: dict,
+    weekday_profile: dict,
+    base_lambda: float,
+    mean_handle_sec: float,
+    n_agents: int,
+    target_occupancy: float = 0.75,
+) -> dict:
+    """Planning par heure, dimensionné pour un jour de semaine moyen."""
+    weekday_mean = np.mean([weekday_profile.get(day, 1.0) for day in range(5)])
+    schedule = {}
+    for hour, multiplier in hourly_profile.items():
+        charge = base_lambda * multiplier * weekday_mean * mean_handle_sec / 3600
+        schedule[hour] = int(np.clip(math.ceil(charge / target_occupancy), 1, n_agents))
+    return schedule
+
+
 def generate_synthetic_calls(
     start_date: str,
     end_date: str,
@@ -50,121 +81,99 @@ def generate_synthetic_calls(
     base_lambda: float = 18.0,
     hourly_profile: Optional[dict] = None,
     weekday_profile: Optional[dict] = None,
-    mean_wait_sec: float = 25.0,
-    wait_threshold_for_abandon_sec: float = 60.0,
+    mean_patience_sec: float = 150.0,
     mean_talk_sec: float = 210.0,
     mean_post_call_sec: float = 45.0,
-    agent_skill_spread: float = 0.25,
+    agent_skill_spread: float = 0.15,
     learning_curve: bool = True,
+    schedule: Optional[dict] = None,
     random_seed: Optional[int] = 42,
 ) -> pd.DataFrame:
     """
-    Genere un DataFrame de niveau "appel individuel" pret a etre exporte
-    en CSV avec les colonnes attendues par l'application.
+    Génère un DataFrame d'appels individuels, avec les colonnes du CSV attendu :
+    id_appel, date_heure, statut, post_appel, temps_communication, temps_attente,
+    id_agent.
 
-    Parameters
+    Paramètres
     ----------
-    start_date, end_date : str ("YYYY-MM-DD"), bornes (incluses) de la
-        periode simulee.
-    agents : liste des identifiants d'agents disponibles.
-    base_lambda : nombre moyen d'appels par heure pour une tranche/jour
-        "de reference" (profil = 1.0), avant application des profils.
-    hourly_profile : dict {heure: multiplicateur}. Heures hors plage =
-        centre d'appels ferme (aucun appel genere).
-    weekday_profile : dict {0=lundi..6=dimanche: multiplicateur}.
-    mean_wait_sec : temps d'attente moyen cible (loi exponentielle).
-    wait_threshold_for_abandon_sec : au-dela de ce temps d'attente simule,
-        l'appel est considere comme abandonne (statut = non_repondu).
-    mean_talk_sec, mean_post_call_sec : moyennes (loi log-normale) pour
-        le temps de communication et le temps de post-appel.
-    agent_skill_spread : ecart-type relatif du "niveau" de chaque agent
-        (un agent plus rapide aura une DMT plus faible en moyenne).
-    learning_curve : si True, la DMT diminue legerement au fil du temps
-        (apprentissage progressif des agents).
-    random_seed : graine aleatoire pour la reproductibilite.
-
-    Returns
-    -------
-    pd.DataFrame avec les colonnes :
-        id_appel, date_heure, statut, post_appel, temps_communication,
-        temps_attente, id_agent
+    start_date, end_date : bornes incluses, au format "YYYY-MM-DD".
+    agents : identifiants des agents disponibles.
+    base_lambda : appels par heure pour un multiplicateur de 1.0.
+    hourly_profile : {heure: multiplicateur}, le centre est fermé aux autres heures.
+    weekday_profile : {0 = lundi ... 6 = dimanche: multiplicateur}.
+    mean_patience_sec : patience moyenne des appelants (loi exponentielle).
+    mean_talk_sec, mean_post_call_sec : durées moyennes, de loi log-normale.
+    agent_skill_spread : dispersion du niveau des agents (multiplicateur de DMT).
+    learning_curve : si True, la DMT baisse de 20 % sur la période simulée.
+    schedule : {heure: agents} ou {(jour, heure): agents}, calculé si absent.
+    random_seed : graine aléatoire, pour la reproductibilité.
     """
     rng = np.random.default_rng(random_seed)
     hourly_profile = hourly_profile or DEFAULT_HOURLY_PROFILE
     weekday_profile = weekday_profile or DEFAULT_WEEKDAY_PROFILE
-
-    dates = pd.date_range(start_date, end_date, freq="D")
-    n_days_total = max(len(dates), 1)
-
-    # Niveau de competence individuel de chaque agent (multiplicateur de DMT)
-    agent_skill = {
-        a: float(np.clip(rng.normal(1.0, agent_skill_spread), 0.6, 1.6))
-        for a in agents
-    }
-
-    rows = []
-    call_id = 1
-
-    for day_idx, day in enumerate(dates):
-        weekday_mult = weekday_profile.get(day.weekday(), 1.0)
-        # Progression de l'apprentissage : -20% de DMT sur toute la periode simulee
-        learning_mult = (
-            1.0 - 0.20 * (day_idx / max(n_days_total - 1, 1)) if learning_curve else 1.0
+    agents = list(agents)
+    if schedule is None:
+        schedule = build_schedule(
+            hourly_profile, weekday_profile, base_lambda,
+            mean_talk_sec + mean_post_call_sec, len(agents),
         )
 
-        for hour, hour_mult in hourly_profile.items():
-            lam = max(base_lambda * hour_mult * weekday_mult, 0.05)
-            n_calls = rng.poisson(lam)
-            if n_calls == 0:
-                continue
+    skills = np.clip(rng.normal(1.0, agent_skill_spread, len(agents)), 0.6, 1.6)
+    dates = pd.date_range(start_date, end_date, freq="D")
+    sigma = 0.35
+    log_shift = -sigma ** 2 / 2  # pour que la moyenne soit bien celle demandée
 
-            slot_start = pd.Timestamp(day) + pd.Timedelta(hours=hour)
-            offsets_seconds = rng.uniform(0, 3600, size=n_calls)
-            timestamps = slot_start + pd.to_timedelta(offsets_seconds, unit="s")
+    rows = []
+    for day_index, day in enumerate(dates):
+        arrivals = np.concatenate([
+            hour * 3600 + rng.uniform(0, 3600, rng.poisson(
+                true_call_rate(day.weekday(), hour, base_lambda, hourly_profile, weekday_profile)
+            ))
+            for hour in hourly_profile
+        ])
+        if arrivals.size == 0:
+            continue
+        arrivals = np.sort(arrivals)
 
-            waits = rng.exponential(mean_wait_sec, size=n_calls)
-            assigned_agents = rng.choice(agents, size=n_calls)
+        learning = 1.0
+        if learning_curve:
+            learning -= 0.20 * day_index / max(len(dates) - 1, 1)
 
-            for i in range(n_calls):
-                wait = float(waits[i])
-                agent = assigned_agents[i]
-                abandoned = wait > wait_threshold_for_abandon_sec
+        talks, posts = {}, {}
 
-                if abandoned:
-                    rows.append({
-                        "id_appel": f"C{call_id:06d}",
-                        "date_heure": timestamps[i],
-                        "statut": STATUT_NON_REPONDU,
-                        "post_appel": np.nan,
-                        "temps_communication": np.nan,
-                        "temps_attente": round(wait, 1),
-                        "id_agent": "",
-                    })
-                else:
-                    skill = agent_skill[agent] * learning_mult
-                    talk = float(rng.lognormal(
-                        mean=np.log(mean_talk_sec * skill), sigma=0.35
-                    ))
-                    post_call = float(rng.lognormal(
-                        mean=np.log(mean_post_call_sec * skill), sigma=0.35
-                    ))
-                    rows.append({
-                        "id_appel": f"C{call_id:06d}",
-                        "date_heure": timestamps[i],
-                        "statut": STATUT_REPONDU,
-                        "post_appel": round(post_call, 1),
-                        "temps_communication": round(talk, 1),
-                        "temps_attente": round(wait, 1),
-                        "id_agent": agent,
-                    })
-                call_id += 1
+        def service_time(agent: int, call: int) -> float:
+            speed = skills[agent] * learning
+            talks[call] = mean_talk_sec * speed * rng.lognormal(log_shift, sigma)
+            posts[call] = mean_post_call_sec * speed * rng.lognormal(log_shift, sigma)
+            return talks[call] + posts[call]
+
+        def active_agents(moment_sec: float, weekday: int = day.weekday()) -> int:
+            hour = int(moment_sec // 3600)
+            return schedule.get((weekday, hour), schedule.get(hour, 1))
+
+        waits, servers, _ = simulate_fcfs(
+            arrivals, service_time, len(agents),
+            patience_sec=rng.exponential(mean_patience_sec, arrivals.size),
+            active_servers=active_agents,
+        )
+
+        for call, arrival in enumerate(arrivals):
+            answered = servers[call] >= 0
+            rows.append({
+                "date_heure": day + pd.Timedelta(seconds=round(float(arrival))),
+                "statut": STATUT_REPONDU if answered else STATUT_NON_REPONDU,
+                "post_appel": round(posts[call], 1) if answered else np.nan,
+                "temps_communication": round(talks[call], 1) if answered else np.nan,
+                "temps_attente": round(float(waits[call]), 1),
+                "id_agent": agents[servers[call]] if answered else "",
+            })
 
     df = pd.DataFrame(rows).sort_values("date_heure").reset_index(drop=True)
+    df.insert(0, "id_appel", [f"C{i + 1:06d}" for i in range(len(df))])
     return df
 
 
 if __name__ == "__main__":
-    # Petit jeu de demo : 90 jours, 5 agents
     demo = generate_synthetic_calls("2026-01-01", "2026-03-31")
-    demo.to_csv("sample_data.csv", index=False)
-    print(f"{len(demo)} appels generes -> sample_data.csv")
+    demo.to_csv("exemple_donnees_appels.csv", index=False)
+    print(f"{len(demo)} appels générés -> exemple_donnees_appels.csv")

@@ -1,33 +1,21 @@
 """
 models.py
 =========
-Modeles de prevision du volume d'appels (par date + tranche horaire) et
-moteur de recommandation de staffing.
+Modèles de prévision du volume d'appels par date et tranche horaire.
 
-Architecture pensee pour etre MODULAIRE : chaque modele est une classe qui
-implemente la meme interface (fit / predict). Pour ajouter un nouveau
-modele, il suffit de :
-    1. Creer une classe qui herite de `BaseForecastModel`.
-    2. Implementer `_fit(self, train_df)` et `_predict(self, future_df)`.
-    3. L'ajouter au dictionnaire `MODEL_REGISTRY` en bas de ce fichier.
-L'application Streamlit (app.py) n'a alors rien a modifier : elle lit
-`MODEL_REGISTRY` pour peupler la liste des modeles disponibles.
+Pour ajouter un modèle : créer une classe héritant de `BaseForecastModel`,
+implémenter `_fit` et `_predict`, puis l'ajouter à `MODEL_REGISTRY`. L'application
+lit ce registre et n'a pas besoin d'être modifiée.
 
-Modeles fournis (5 + 1 variante probabiliste classique) :
-    - Regression lineaire              (LinearRegressionModel)
-    - SARIMA (par tranche horaire)     (SarimaModel)
-    - Prophet (par tranche horaire)    (ProphetModel)
-    - XGBoost (objectif Poisson)       (XGBoostModel)
-    - Regression de Poisson (GLM)      (PoissonRegressionModel)   [probabiliste, frequentiste]
-    - Regression de Poisson Bayesienne (BayesianPoissonModel)     [probabiliste, bayesien]
+Un volume d'appels par tranche contient une part de hasard qu'aucun modèle ne peut
+prévoir, même en connaissant le vrai rythme d'appels. `noise_limits` estime ce
+plafond : c'est la référence à laquelle comparer les scores.
 """
 
 from __future__ import annotations
 
-import math
 import warnings
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -39,120 +27,84 @@ warnings.filterwarnings("ignore")
 
 
 # ---------------------------------------------------------------------------
-# Ingenierie des features tabulaires (partagee par les modeles tabulaires)
+# Features et intervalles partagés
 # ---------------------------------------------------------------------------
 
 class TabularFeatureBuilder:
     """
-    Construit une matrice de features tabulaires a partir du DataFrame
-    agrege (sortie de `utils.aggregate_by_slot`), utilisable par les
-    modeles de type regression / arbre (LinearRegression, XGBoost, GLM
-    Poisson, Poisson Bayesien).
+    Features calendaires : indicatrices du jour et de la tranche, plus une tendance
+    optionnelle. La première catégorie de chaque variable sert de référence : garder
+    toutes les indicatrices avec une constante rendrait le modèle non identifiable.
 
-    Features generees :
-        - one-hot du jour de la semaine (jour_semaine_num, 0=lundi)
-        - one-hot de la tranche horaire (heure_debut)
-        - tendance temporelle (nombre de jours depuis la 1ere date vue
-          a l'entrainement -> capture une derive lente du volume)
-        - week_end (0/1)
-        - volume_lag_7 (optionnel) : volume observe 7 jours plus tot pour
-          la meme tranche horaire (capture l'autocorrelation hebdomadaire)
-
-    Le builder memorise les categories vues a l'entrainement (`fit`) afin
-    que `transform` produise exactement les memes colonnes pour les
-    donnees futures, meme si certaines categories n'apparaissent pas dans
-    le futur (colonnes mises a 0).
+    La tendance est désactivée par défaut : sur quelques mois d'historique, la
+    prolonger dans le futur dégrade la prévision sans contrepartie mesurable.
     """
 
-    def __init__(self, use_lag_7: bool = True):
-        self.use_lag_7 = use_lag_7
-        self.weekday_categories_ = None
-        self.slot_categories_ = None
+    def __init__(self, use_trend: bool = False):
+        self.use_trend = use_trend
+        self.weekdays_: list = []
+        self.slots_: list = []
         self.date_ref_ = None
-        self.history_: Optional[pd.DataFrame] = None  # pour les lags
-        self.feature_names_: list = []
 
     def fit(self, train_df: pd.DataFrame) -> "TabularFeatureBuilder":
-        self.weekday_categories_ = sorted(train_df["jour_semaine_num"].unique())
-        self.slot_categories_ = sorted(train_df["heure_debut"].unique())
+        self.weekdays_ = sorted(train_df["jour_semaine_num"].unique())
+        self.slots_ = sorted(train_df["heure_debut"].unique())
         self.date_ref_ = pd.to_datetime(train_df["date"]).min()
-        self.history_ = train_df[["date", "heure_debut", "volume"]].copy()
         return self
 
-    def _base_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = pd.DataFrame(index=df.index)
-        dates = pd.to_datetime(df["date"])
-        out["trend"] = (dates - self.date_ref_).dt.days.astype(float)
-        out["week_end"] = df["jour_semaine_num"].isin([5, 6]).astype(int)
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        features = {}
+        if self.use_trend:
+            features["trend"] = (pd.to_datetime(df["date"]) - self.date_ref_).dt.days.astype(float)
+        for weekday in self.weekdays_[1:]:
+            features[f"jour_{weekday}"] = (df["jour_semaine_num"] == weekday).astype(float)
+        for slot in self.slots_[1:]:
+            features[f"slot_{slot}"] = (df["heure_debut"] == slot).astype(float)
+        return pd.DataFrame(features, index=df.index)
 
-        for w in self.weekday_categories_:
-            out[f"jour_{w}"] = (df["jour_semaine_num"] == w).astype(int)
-        for s in self.slot_categories_:
-            out[f"slot_{s}"] = (df["heure_debut"] == s).astype(int)
-        return out
 
-    def _lag_7(self, df: pd.DataFrame, extra_history: Optional[pd.DataFrame]) -> pd.Series:
-        history = self.history_
-        if extra_history is not None:
-            history = pd.concat([history, extra_history], ignore_index=True)
-        history = history.drop_duplicates(subset=["date", "heure_debut"], keep="last")
-        history = history.rename(columns={"volume": "volume_lag_7"})
-        history["date"] = pd.to_datetime(history["date"]) + pd.Timedelta(days=7)
+def dispersion_factor(y_true: np.ndarray, y_fit: np.ndarray) -> float:
+    """Facteur phi tel que variance = phi × moyenne, au moins 1 (cas Poisson)."""
+    mean = np.clip(y_fit, 1e-6, None)
+    return max(float(np.sum((y_true - mean) ** 2) / np.sum(mean)), 1.0)
 
-        merged = df[["date", "heure_debut"]].copy()
-        merged["date"] = pd.to_datetime(merged["date"])
-        merged = merged.merge(history, on=["date", "heure_debut"], how="left")
-        # a defaut de lag connu (debut de periode), on retombe sur la
-        # moyenne globale du slot observee a l'entrainement
-        fallback = self.history_.groupby("heure_debut")["volume"].mean()
-        merged["volume_lag_7"] = merged.apply(
-            lambda r: r["volume_lag_7"] if pd.notna(r["volume_lag_7"])
-            else fallback.get(r["heure_debut"], self.history_["volume"].mean()),
-            axis=1,
-        )
-        return merged["volume_lag_7"].values
 
-    def transform(self, df: pd.DataFrame, extra_history: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """
-        extra_history : DataFrame optionnel (date, heure_debut, volume)
-            contenant des observations reelles supplementaires (ex : le
-            jeu de test) permettant de calculer le lag-7 sans fuite de
-            donnees (on n'utilise que des volumes deja "passes" au moment
-            de la prevision).
-        """
-        feats = self._base_features(df)
-        if self.use_lag_7:
-            feats["volume_lag_7"] = self._lag_7(df, extra_history)
-        self.feature_names_ = list(feats.columns)
-        return feats
+def count_interval(mean: np.ndarray, phi: float = 1.0, level: float = 0.95) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Intervalle de prédiction d'un comptage : il doit contenir le volume réellement
+    observé, pas seulement sa moyenne. Loi de Poisson si phi = 1, sinon binomiale
+    négative de variance phi × moyenne.
+    """
+    mean = np.clip(np.asarray(mean, dtype=float), 1e-6, None)
+    alpha = (1 - level) / 2
+    if phi <= 1.0 + 1e-6:
+        return stats.poisson.ppf(alpha, mean), stats.poisson.ppf(1 - alpha, mean)
+    size, prob = mean / (phi - 1), 1 / phi
+    return stats.nbinom.ppf(alpha, size, prob), stats.nbinom.ppf(1 - alpha, size, prob)
 
 
 # ---------------------------------------------------------------------------
-# Interface commune des modeles
+# Interface commune
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ForecastResult:
-    """Sortie standardisee de tous les modeles : moyenne + (eventuel) intervalle a 95%."""
+    """Sortie de tous les modèles : moyenne et intervalle de prédiction à 95 %."""
     pred_mean: np.ndarray
-    pred_lower: Optional[np.ndarray] = None
-    pred_upper: Optional[np.ndarray] = None
+    pred_lower: np.ndarray
+    pred_upper: np.ndarray
 
     def as_dataframe(self) -> pd.DataFrame:
-        df = pd.DataFrame({"pred_mean": self.pred_mean})
-        df["pred_lower"] = self.pred_lower if self.pred_lower is not None else np.nan
-        df["pred_upper"] = self.pred_upper if self.pred_upper is not None else np.nan
-        return df
+        return pd.DataFrame({
+            "pred_mean": self.pred_mean,
+            "pred_lower": self.pred_lower,
+            "pred_upper": self.pred_upper,
+        })
 
 
 class BaseForecastModel:
-    """
-    Interface commune. `train_df` et `future_df` sont des DataFrames issus
-    de `utils.aggregate_by_slot` (colonnes : date, tranche, heure_debut,
-    jour_semaine, jour_semaine_num, volume, ...).
-    """
+    """`train_df` et `future_df` ont les colonnes de `utils.aggregate_by_slot`."""
     name: str = "BaseModel"
-    is_bayesian: bool = False
     description: str = ""
 
     def fit(self, train_df: pd.DataFrame) -> "BaseForecastModel":
@@ -160,587 +112,386 @@ class BaseForecastModel:
         self._fitted = True
         return self
 
-    def predict(self, future_df: pd.DataFrame, extra_history: Optional[pd.DataFrame] = None) -> ForecastResult:
+    def predict(self, future_df: pd.DataFrame) -> ForecastResult:
         if not getattr(self, "_fitted", False):
-            raise RuntimeError(f"Le modele {self.name} doit etre entraine (fit) avant predict().")
-        return self._predict(future_df, extra_history=extra_history)
+            raise RuntimeError(f"Le modèle {self.name} doit être entraîné avant predict().")
+        return self._predict(future_df)
 
-    # A implementer dans chaque sous-classe
     def _fit(self, train_df: pd.DataFrame):
         raise NotImplementedError
 
-    def _predict(self, future_df: pd.DataFrame, extra_history: Optional[pd.DataFrame] = None) -> ForecastResult:
+    def _predict(self, future_df: pd.DataFrame) -> ForecastResult:
         raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
-# 1. Regression lineaire (baseline)
+# Référence
+# ---------------------------------------------------------------------------
+
+class SeasonalAverageModel(BaseForecastModel):
+    name = "Référence (moyenne 4 semaines)"
+    description = (
+        "Moyenne du même jour et de la même tranche sur les 4 dernières semaines. "
+        "Sans paramètre à entraîner, c'est le score à battre : un modèle plus "
+        "complexe ne se justifie que s'il fait mieux."
+    )
+
+    def __init__(self, weeks: int = 4):
+        self.weeks = weeks
+
+    def _fit(self, train_df):
+        recent = train_df[train_df["date"] > train_df["date"].max() - pd.Timedelta(weeks=self.weeks)]
+        self.means_ = recent.groupby(["jour_semaine_num", "heure_debut"])["volume"].mean().rename("mean")
+        self.slot_means_ = train_df.groupby("heure_debut")["volume"].mean().rename("slot_mean")
+        self.global_mean_ = float(train_df["volume"].mean())
+
+    def _predict(self, future_df):
+        keys = future_df[["jour_semaine_num", "heure_debut"]]
+        out = keys.merge(self.means_.reset_index(), on=["jour_semaine_num", "heure_debut"], how="left")
+        out = out.merge(self.slot_means_.reset_index(), on="heure_debut", how="left")
+        mean = out["mean"].fillna(out["slot_mean"]).fillna(self.global_mean_).to_numpy()
+        return ForecastResult(mean, *count_interval(mean))
+
+
+# ---------------------------------------------------------------------------
+# Régression linéaire
 # ---------------------------------------------------------------------------
 
 class LinearRegressionModel(BaseForecastModel):
-    name = "Regression lineaire"
-    is_bayesian = False
+    name = "Régression linéaire"
     description = (
-        "Modele de reference (baseline). Rapide et tres interpretable, mais "
-        "ne capture pas naturellement le caractere "
-        "discret/positif des comptages d'appels (peut predire des valeurs "
-        "negatives) et suppose une relation lineaire entre les features et "
-        "le volume."
+        "Rapide et interprétable, mais additive : elle ajoute l'effet du jour à celui "
+        "de l'heure, alors que ces effets se multiplient. Elle surestime donc les "
+        "heures creuses du week-end."
     )
 
     def __init__(self):
-        self.builder = TabularFeatureBuilder(use_lag_7=True)
+        self.builder = TabularFeatureBuilder()
         self.model = LinearRegression()
 
     def _fit(self, train_df):
         self.builder.fit(train_df)
         X = self.builder.transform(train_df)
-        y = train_df["volume"].values
+        y = train_df["volume"].to_numpy(dtype=float)
         self.model.fit(X, y)
-        self._residual_std = float(np.std(y - self.model.predict(X)))
+        self.phi_ = dispersion_factor(y, np.clip(self.model.predict(X), 0, None))
 
-    def _predict(self, future_df, extra_history=None):
-        X = self.builder.transform(future_df, extra_history=extra_history)
-        mean = np.clip(self.model.predict(X), 0, None)
-        # Intervalle approximatif base sur l'ecart-type des residus d'entrainement
-        z = stats.norm.ppf(0.975)
-        lower = np.clip(mean - z * self._residual_std, 0, None)
-        upper = mean + z * self._residual_std
-        return ForecastResult(mean, lower, upper)
+    def _predict(self, future_df):
+        mean = np.clip(self.model.predict(self.builder.transform(future_df)), 0, None)
+        return ForecastResult(mean, *count_interval(mean, self.phi_))
 
 
 # ---------------------------------------------------------------------------
-# 2. SARIMA (un modele par tranche horaire)
+# Séries temporelles : un modèle par tranche
 # ---------------------------------------------------------------------------
 
 class SarimaModel(BaseForecastModel):
     name = "SARIMA"
-    is_bayesian = False
     description = (
-        "Un modele SARIMA est entraine independamment pour chaque tranche "
-        "horaire, sur la serie quotidienne du volume de cette tranche, avec "
-        "une saisonnalite hebdomadaire (periode = 7 jours). Bon choix si "
-        "l'historique est suffisant (plusieurs mois) et que la saisonnalite "
-        "hebdomadaire est stable ; plus lent a entrainer que les modeles "
-        "tabulaires et moins flexible si de nouvelles tranches apparaissent."
+        "Un modèle par tranche horaire, avec une saisonnalité hebdomadaire. Il ne "
+        "partage aucune information entre les tranches et dispose de peu "
+        "d'observations par tranche sur quelques mois d'historique."
     )
 
-    def __init__(self, order=(1, 1, 1), seasonal_order=(1, 0, 1, 7)):
+    def __init__(self, order=(1, 0, 1), seasonal_order=(0, 1, 1, 7)):
         self.order = order
         self.seasonal_order = seasonal_order
         self.slot_models_ = {}
-        self.slot_last_date_ = {}
-
-    def _series_for_slot(self, df, slot):
-        sub = df[df["heure_debut"] == slot][["date", "volume"]].copy()
-        sub["date"] = pd.to_datetime(sub["date"])
-        sub = sub.groupby("date")["volume"].mean().asfreq("D")
-        sub = sub.interpolate(limit_direction="both")
-        return sub
 
     def _fit(self, train_df):
         from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-        for slot in sorted(train_df["heure_debut"].unique()):
-            series = self._series_for_slot(train_df, slot)
-            if len(series) < 14 or series.nunique() <= 1:
-                continue  # historique insuffisant pour ce slot
+        self.global_mean_ = float(train_df["volume"].mean())
+        self.last_date_ = pd.to_datetime(train_df["date"]).max()
+        for slot, group in train_df.groupby("heure_debut"):
+            series = group.set_index(pd.to_datetime(group["date"]))["volume"].astype(float)
+            series = series.asfreq("D").interpolate(limit_direction="both")  # jours fériés retirés
+            if len(series) < 21 or series.nunique() <= 1:
+                continue
             try:
-                fitted = SARIMAX(
-                    series,
-                    order=self.order,
-                    seasonal_order=self.seasonal_order,
-                    enforce_stationarity=False,
-                    enforce_invertibility=False,
+                self.slot_models_[slot] = SARIMAX(
+                    series, order=self.order, seasonal_order=self.seasonal_order,
+                    enforce_stationarity=False, enforce_invertibility=False,
                 ).fit(disp=False)
-                self.slot_models_[slot] = fitted
-                self.slot_last_date_[slot] = series.index.max()
             except Exception:
                 continue
-        self._global_mean = train_df["volume"].mean()
 
-    def _predict(self, future_df, extra_history=None):
-        means, lowers, uppers = [], [], []
-        for _, row in future_df.iterrows():
-            slot = row["heure_debut"]
-            target_date = pd.to_datetime(row["date"])
-            model = self.slot_models_.get(slot)
-            if model is None:
-                means.append(self._global_mean)
-                lowers.append(max(self._global_mean * 0.5, 0))
-                uppers.append(self._global_mean * 1.5)
+    def _predict(self, future_df):
+        n_rows = len(future_df)
+        mean = np.full(n_rows, self.global_mean_)
+        lower, upper = count_interval(mean)
+        dates = pd.to_datetime(future_df["date"]).to_numpy()
+        slots = future_df["heure_debut"].to_numpy()
+        steps = ((dates - np.datetime64(self.last_date_)) / np.timedelta64(1, "D")).astype(int)
+
+        for slot, model in self.slot_models_.items():
+            rows = np.where(slots == slot)[0]
+            if rows.size == 0:
                 continue
-            last_date = self.slot_last_date_[slot]
-            steps_ahead = (target_date - last_date).days
-            if steps_ahead < 1:
-                steps_ahead = 1
-            forecast = model.get_forecast(steps=steps_ahead)
-            ci = forecast.conf_int(alpha=0.05)
-            idx = steps_ahead - 1
-            mean_val = max(float(forecast.predicted_mean.iloc[idx]), 0)
-            low_val = max(float(ci.iloc[idx, 0]), 0)
-            up_val = max(float(ci.iloc[idx, 1]), 0)
-            means.append(mean_val)
-            lowers.append(low_val)
-            uppers.append(up_val)
-        return ForecastResult(np.array(means), np.array(lowers), np.array(uppers))
+            forecast = model.get_forecast(steps=int(steps[rows].max()))
+            index = steps[rows] - 1
+            interval = forecast.conf_int(alpha=0.05).to_numpy()
+            mean[rows] = forecast.predicted_mean.to_numpy()[index]
+            lower[rows] = interval[index, 0]
+            upper[rows] = interval[index, 1]
+        return ForecastResult(np.clip(mean, 0, None), np.clip(lower, 0, None), np.clip(upper, 0, None))
 
-
-# ---------------------------------------------------------------------------
-# 3. Prophet (un modele par tranche horaire)
-# ---------------------------------------------------------------------------
 
 class ProphetModel(BaseForecastModel):
     name = "Prophet"
-    is_bayesian = False
     description = (
-        "Comme pour SARIMA, un modele Prophet distinct est entraine par "
-        "tranche horaire sur la serie quotidienne. Prophet gere bien les "
-        "tendances et la saisonnalite hebdomadaire automatiquement, et "
-        "fournit nativement un intervalle de confiance. Tres robuste aux "
-        "donnees manquantes mais peut etre plus lent (un modele par "
-        "tranche horaire)."
+        "Un modèle Prophet par tranche horaire, sans tendance : sur un historique "
+        "court, sa tendance par défaut sur-ajuste les derniers jours."
     )
 
     def __init__(self):
         self.slot_models_ = {}
-        self._global_mean = 0.0
 
     def _fit(self, train_df):
         from prophet import Prophet
 
-        for slot in sorted(train_df["heure_debut"].unique()):
-            sub = train_df[train_df["heure_debut"] == slot][["date", "volume"]].copy()
-            sub["date"] = pd.to_datetime(sub["date"])
-            sub = sub.groupby("date")["volume"].mean().reset_index()
-            sub.columns = ["ds", "y"]
-            if len(sub) < 14 or sub["y"].nunique() <= 1:
+        self.global_mean_ = float(train_df["volume"].mean())
+        for slot, group in train_df.groupby("heure_debut"):
+            data = pd.DataFrame({"ds": pd.to_datetime(group["date"]), "y": group["volume"].astype(float)})
+            if len(data) < 14 or data["y"].nunique() <= 1:
                 continue
+            model = Prophet(
+                growth="flat", weekly_seasonality=True, yearly_seasonality=False,
+                daily_seasonality=False, interval_width=0.95,
+            )
             try:
-                # growth='flat' + peu de changepoints : le volume d'appels
-                # d'un centre d'appels n'a generalement pas de tendance
-                # forte (contrairement a une serie de vente par ex.), et
-                # l'historique disponible par tranche est souvent court
-                # (quelques mois). Le growth lineaire par defaut de Prophet
-                # a tendance a sur-ajuster sur ce type de serie courte.
-                m = Prophet(
-                    growth="flat",
-                    n_changepoints=4,
-                    changepoint_prior_scale=0.01,
-                    weekly_seasonality=True,
-                    yearly_seasonality=False,
-                    daily_seasonality=False,
-                    interval_width=0.95,
-                )
-                m.fit(sub)
-                self.slot_models_[slot] = m
+                self.slot_models_[slot] = model.fit(data)
             except Exception:
                 continue
-        self._global_mean = train_df["volume"].mean()
 
-    def _predict(self, future_df, extra_history=None):
-        means, lowers, uppers = [], [], []
-        for slot in sorted(future_df["heure_debut"].unique()):
-            model = self.slot_models_.get(slot)
-            mask = future_df["heure_debut"] == slot
-            dates = pd.to_datetime(future_df.loc[mask, "date"])
-            if model is None:
-                for _ in dates:
-                    means.append(self._global_mean)
-                    lowers.append(max(self._global_mean * 0.5, 0))
-                    uppers.append(self._global_mean * 1.5)
+    def _predict(self, future_df):
+        mean = np.full(len(future_df), self.global_mean_)
+        lower, upper = count_interval(mean)
+        dates = pd.to_datetime(future_df["date"])
+        slots = future_df["heure_debut"].to_numpy()
+
+        for slot, model in self.slot_models_.items():
+            rows = np.where(slots == slot)[0]
+            if rows.size == 0:
                 continue
-            future = pd.DataFrame({"ds": dates})
-            fc = model.predict(future)
-            means.extend(np.clip(fc["yhat"].values, 0, None))
-            lowers.extend(np.clip(fc["yhat_lower"].values, 0, None))
-            uppers.extend(np.clip(fc["yhat_upper"].values, 0, None))
-        # Replacer les predictions (calculees slot par slot) dans l'ordre
-        # d'origine des lignes de future_df.
-        positions = np.concatenate([
-            np.where(future_df["heure_debut"].values == s)[0]
-            for s in sorted(future_df["heure_debut"].unique())
-        ])
-        means, lowers, uppers = np.array(means), np.array(lowers), np.array(uppers)
-        result = np.empty_like(means)
-        result_l = np.empty_like(lowers)
-        result_u = np.empty_like(uppers)
-        result[positions] = means
-        result_l[positions] = lowers
-        result_u[positions] = uppers
-        return ForecastResult(result, result_l, result_u)
+            ds = dates.iloc[rows].reset_index(drop=True)
+            forecast = model.predict(pd.DataFrame({"ds": ds})).set_index("ds").reindex(ds)
+            mean[rows] = forecast["yhat"].to_numpy()
+            lower[rows] = forecast["yhat_lower"].to_numpy()
+            upper[rows] = forecast["yhat_upper"].to_numpy()
+        return ForecastResult(np.clip(mean, 0, None), np.clip(lower, 0, None), np.clip(upper, 0, None))
 
 
 # ---------------------------------------------------------------------------
-# 4. XGBoost (objectif Poisson, adapte aux comptages)
+# Machine learning
 # ---------------------------------------------------------------------------
 
 class XGBoostModel(BaseForecastModel):
     name = "XGBoost (Poisson)"
-    is_bayesian = False
     description = (
-        "Gradient boosting (XGBoost) avec objectif 'count:poisson', adapte "
-        "aux donnees de comptage. Capture des interactions non lineaires "
-        "entre jour de semaine / tranche horaire / tendance que la "
-        "regression lineaire ne peut pas voir. Tres performant si "
-        "l'historique est suffisant, mais moins interpretable et l'intervalle "
-        "de confiance fourni ici est approximatif (base sur les residus)."
+        "Gradient boosting pour données de comptage. Utile quand les effets calendaires "
+        "interagissent de façon complexe, mais moins précis qu'un GLM quand le jour et "
+        "l'heure ont des effets simplement multiplicatifs."
     )
 
-    def __init__(self, n_estimators: int = 200, max_depth: int = 4, learning_rate: float = 0.08):
+    def __init__(self, n_estimators: int = 150, max_depth: int = 3, learning_rate: float = 0.08):
         import xgboost as xgb
 
-        self.builder = TabularFeatureBuilder(use_lag_7=True)
+        self.builder = TabularFeatureBuilder()
         self.model = xgb.XGBRegressor(
-            objective="count:poisson",
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=42,
+            objective="count:poisson", n_estimators=n_estimators, max_depth=max_depth,
+            learning_rate=learning_rate, subsample=0.9, colsample_bytree=0.9, random_state=42,
+            n_jobs=1,  # le jeu est petit : plusieurs threads ralentissent nettement l'entraînement
         )
 
     def _fit(self, train_df):
         self.builder.fit(train_df)
-        X = self.builder.transform(train_df)
-        y = train_df["volume"].values
-        self.model.fit(X, y)
-        self._residual_std = float(np.std(y - self.model.predict(X)))
+        self.model.fit(self.builder.transform(train_df), train_df["volume"].to_numpy(dtype=float))
 
-    def _predict(self, future_df, extra_history=None):
-        X = self.builder.transform(future_df, extra_history=extra_history)
-        mean = np.clip(self.model.predict(X), 0, None)
-        z = stats.norm.ppf(0.975)
-        lower = np.clip(mean - z * self._residual_std, 0, None)
-        upper = mean + z * self._residual_std
-        return ForecastResult(mean, lower, upper)
+    def _predict(self, future_df):
+        mean = np.clip(self.model.predict(self.builder.transform(future_df)), 0, None)
+        return ForecastResult(mean, *count_interval(mean))
 
 
 # ---------------------------------------------------------------------------
-# 5. Regression de Poisson (GLM, statsmodels) -- probabiliste frequentiste
+# Modèles probabilistes
 # ---------------------------------------------------------------------------
 
 class PoissonRegressionModel(BaseForecastModel):
-    name = "Regression de Poisson (GLM)"
-    is_bayesian = False
+    name = "Régression de Poisson (GLM)"
     description = (
-        "Modele lineaire generalise (GLM) avec une loi de Poisson : adapte "
-        "nativement aux comptages (predictions toujours positives, variance "
-        "liee a la moyenne). Fournit un intervalle de confiance a 95% sur "
-        "la moyenne predite. Plus simple et plus rapide que la version "
-        "bayesienne, mais l'incertitude qu'il fournit ne porte que sur le "
-        "parametre moyen, pas sur la variabilite intrinseque du comptage "
-        "(contrairement a l'intervalle predictif bayesien)."
+        "Adaptée aux comptages et multiplicative : effet du jour × effet de l'heure. "
+        "Son intervalle de prédiction inclut l'aléa du comptage, et s'élargit "
+        "automatiquement en cas de sur-dispersion."
     )
 
     def __init__(self):
-        self.builder = TabularFeatureBuilder(use_lag_7=True)
-        self.result_ = None
+        self.builder = TabularFeatureBuilder()
+
+    def _design(self, df: pd.DataFrame) -> pd.DataFrame:
+        import statsmodels.api as sm
+
+        return sm.add_constant(self.builder.transform(df), has_constant="add").astype(float)
 
     def _fit(self, train_df):
         import statsmodels.api as sm
 
         self.builder.fit(train_df)
-        X = self.builder.transform(train_df)
-        X_const = sm.add_constant(X, has_constant="add")
-        y = train_df["volume"].values
-        model = sm.GLM(y, X_const, family=sm.families.Poisson())
-        self.result_ = model.fit()
-        self._X_columns = X_const.columns
+        X = self._design(train_df)
+        y = train_df["volume"].to_numpy(dtype=float)
+        self.result_ = sm.GLM(y, X, family=sm.families.Poisson()).fit()
+        self.phi_ = dispersion_factor(y, np.asarray(self.result_.predict(X)))
 
-    def _predict(self, future_df, extra_history=None):
-        import statsmodels.api as sm
+    def _predict(self, future_df):
+        mean = np.asarray(self.result_.predict(self._design(future_df)))
+        return ForecastResult(mean, *count_interval(mean, self.phi_))
 
-        X = self.builder.transform(future_df, extra_history=extra_history)
-        X_const = sm.add_constant(X, has_constant="add")
-        X_const = X_const.reindex(columns=self._X_columns, fill_value=0)
-        pred = self.result_.get_prediction(X_const)
-        summary = pred.summary_frame(alpha=0.05)
-        mean = summary["mean"].values
-        lower = summary["mean_ci_lower"].values
-        upper = summary["mean_ci_upper"].values
-        return ForecastResult(mean, np.clip(lower, 0, None), upper)
-
-
-# ---------------------------------------------------------------------------
-# 6. Regression de Poisson Bayesienne (PyMC) -- incertitude complete
-# ---------------------------------------------------------------------------
 
 class BayesianPoissonModel(BaseForecastModel):
-    name = "Poisson Bayesien (PyMC)"
-    is_bayesian = True
+    name = "Poisson bayésien (PyMC)"
     description = (
-        "Regression de Poisson bayesienne (PyMC). Au lieu d'une seule valeur "
-        "predite, on obtient une distribution complete de previsions "
-        "possibles : la moyenne, mais aussi un intervalle credible a 95% "
-        "qui integre a la fois l'incertitude sur les parametres du modele "
-        "et la variabilite naturelle du nombre d'appels (loi de Poisson). "
-        "C'est le seul modele ici qui repond directement a la question "
-        "'quelle est la probabilite que le volume soit dans telle "
-        "fourchette ?'. Plus couteux en temps de calcul (echantillonnage "
-        "MCMC) que les autres modeles."
+        "Même structure que le GLM, avec une incertitude complète sur les paramètres. "
+        "Beaucoup plus lent : il n'apporte un gain que sur un historique très court."
     )
 
-    def __init__(self, draws: int = 600, tune: int = 600, chains: int = 2, seed: int = 42):
-        self.builder = TabularFeatureBuilder(use_lag_7=True)
-        self.draws = draws
-        self.tune = tune
-        self.chains = chains
-        self.seed = seed
-        self.coef_samples_ = None  # (n_samples, n_features+1)
-        self.feature_columns_ = None
+    def __init__(self, draws: int = 1000, tune: int = 1000, chains: int = 2, seed: int = 42):
+        self.builder = TabularFeatureBuilder()
+        self.draws, self.tune, self.chains, self.seed = draws, tune, chains, seed
+        self.diagnostics: dict = {}
 
     def _fit(self, train_df):
+        import arviz as az
         import pymc as pm
 
         self.builder.fit(train_df)
-        X = self.builder.transform(train_df)
-        self.feature_columns_ = list(X.columns)
-        X_np = X.values.astype(float)
-        # Standardisation des features continues (trend, lag) pour faciliter
-        # l'echantillonnage MCMC ; les indicatrices 0/1 sont laissees telles
-        # quelles (la standardisation casserait leur interpretation directe).
-        self._feature_mean = X_np.mean(axis=0)
-        self._feature_std = X_np.std(axis=0)
-        self._feature_std[self._feature_std == 0] = 1.0
-        is_binary = np.array([set(np.unique(X_np[:, j])) <= {0.0, 1.0} for j in range(X_np.shape[1])])
-        self._feature_mean[is_binary] = 0.0
-        self._feature_std[is_binary] = 1.0
-        X_scaled = (X_np - self._feature_mean) / self._feature_std
+        X = self.builder.transform(train_df).to_numpy(dtype=float)
+        y = train_df["volume"].to_numpy(dtype=int)
 
-        y = train_df["volume"].values.astype(int)
-        n_features = X_scaled.shape[1]
-
-        with pm.Model() as model:
-            intercept = pm.Normal("intercept", mu=np.log(max(y.mean(), 1)), sigma=1.0)
-            betas = pm.Normal("betas", mu=0.0, sigma=0.5, shape=n_features)
-            eta = intercept + pm.math.dot(X_scaled, betas)
-            mu = pm.math.exp(eta)
-            pm.Poisson("y_obs", mu=mu, observed=y)
-
+        with pm.Model():
+            intercept = pm.Normal("intercept", mu=np.log(max(y.mean(), 1)), sigma=2.0)
+            betas = pm.Normal("betas", mu=0.0, sigma=1.5, shape=X.shape[1])
+            pm.Poisson("y_obs", mu=pm.math.exp(intercept + pm.math.dot(X, betas)), observed=y)
             trace = pm.sample(
-                draws=self.draws,
-                tune=self.tune,
-                chains=self.chains,
-                cores=1,
-                random_seed=self.seed,
-                progressbar=False,
-                target_accept=0.9,
+                draws=self.draws, tune=self.tune, chains=self.chains, cores=1,
+                random_seed=self.seed, progressbar=False, target_accept=0.9,
             )
 
-        post = trace.posterior
-        intercept_samples = post["intercept"].values.reshape(-1)
-        beta_samples = post["betas"].values.reshape(-1, n_features)
-        self.coef_samples_ = np.concatenate(
-            [intercept_samples.reshape(-1, 1), beta_samples], axis=1
-        )  # (n_samples, 1 + n_features)
+        posterior = trace.posterior
+        self.intercepts_ = posterior["intercept"].values.reshape(-1)
+        self.betas_ = posterior["betas"].values.reshape(-1, X.shape[1])
+        rhat = az.rhat(trace)
+        self.diagnostics = {
+            "rhat_max": float(max(float(rhat[name].max()) for name in rhat.data_vars)),
+            "divergences": int(trace.sample_stats["diverging"].sum()),
+        }
 
-    def _predict(self, future_df, extra_history=None):
-        X = self.builder.transform(future_df, extra_history=extra_history)
-        X = X.reindex(columns=self.feature_columns_, fill_value=0)
-        X_np = X.values.astype(float)
-        X_scaled = (X_np - self._feature_mean) / self._feature_std
-        X_design = np.concatenate([np.ones((X_scaled.shape[0], 1)), X_scaled], axis=1)
+    def _predict(self, future_df):
+        X = self.builder.transform(future_df).to_numpy(dtype=float)
+        eta = self.intercepts_[None, :] + X @ self.betas_.T
+        mu = np.exp(np.clip(eta, -20, 20))
+        draws = np.random.default_rng(self.seed).poisson(mu)
+        return ForecastResult(
+            mu.mean(axis=1), np.percentile(draws, 2.5, axis=1), np.percentile(draws, 97.5, axis=1)
+        )
 
-        eta_samples = X_design @ self.coef_samples_.T  # (n_obs, n_samples)
-        mu_samples = np.exp(np.clip(eta_samples, -20, 20))
-
-        rng = np.random.default_rng(self.seed)
-        # Distribution predictive complete : pour chaque tirage posterieur
-        # de mu, on tire un comptage de Poisson -> capture a la fois
-        # l'incertitude des parametres ET la variabilite intrinseque du
-        # comptage.
-        pred_samples = rng.poisson(mu_samples)
-
-        mean = mu_samples.mean(axis=1)
-        lower = np.percentile(pred_samples, 2.5, axis=1)
-        upper = np.percentile(pred_samples, 97.5, axis=1)
-        return ForecastResult(mean, lower, upper)
-
-
-# ---------------------------------------------------------------------------
-# Registre des modeles (point d'extension)
-# ---------------------------------------------------------------------------
 
 MODEL_REGISTRY = {
-    LinearRegressionModel.name: LinearRegressionModel,
-    SarimaModel.name: SarimaModel,
-    ProphetModel.name: ProphetModel,
-    XGBoostModel.name: XGBoostModel,
-    PoissonRegressionModel.name: PoissonRegressionModel,
-    BayesianPoissonModel.name: BayesianPoissonModel,
+    model.name: model
+    for model in (
+        SeasonalAverageModel, LinearRegressionModel, PoissonRegressionModel,
+        XGBoostModel, SarimaModel, ProphetModel, BayesianPoissonModel,
+    )
 }
+DEFAULT_MODEL = PoissonRegressionModel.name
+SLOW_MODELS = {BayesianPoissonModel.name}
 
 
 # ---------------------------------------------------------------------------
-# Metriques de performance
+# Évaluation
 # ---------------------------------------------------------------------------
 
-def compute_metrics(y_true, y_pred) -> dict:
-    """Calcule RMSE, MAE, MAPE (%) et R2 entre valeurs reelles et predites."""
+def compute_metrics(y_true, y_pred, dates=None) -> dict:
+    """
+    RMSE, MAE, WAPE et R². Le WAPE (erreur totale / volume total) remplace le MAPE,
+    qui exclut les tranches sans appel et explose sur les tranches à faible volume.
+    Avec `dates`, ajoute le WAPE sur les totaux par jour.
+    """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
+    errors = y_true - y_pred
+    total = y_true.sum()
+    metrics = {
+        "RMSE": float(np.sqrt(np.mean(errors ** 2))),
+        "MAE": float(np.mean(np.abs(errors))),
+        "WAPE (%)": float(np.abs(errors).sum() / total * 100) if total else np.nan,
+        "R2": float(r2_score(y_true, y_pred)) if len(np.unique(y_true)) > 1 else np.nan,
+    }
+    if dates is not None and total:
+        daily = pd.DataFrame({"date": dates, "true": y_true, "pred": y_pred}).groupby("date").sum()
+        metrics["WAPE jour (%)"] = float((daily["true"] - daily["pred"]).abs().sum() / total * 100)
+    return metrics
 
-    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-    mae = float(np.mean(np.abs(y_true - y_pred)))
 
-    mask = y_true != 0
-    mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100) if mask.any() else np.nan
-
-    r2 = float(r2_score(y_true, y_pred)) if len(np.unique(y_true)) > 1 else np.nan
-
-    return {"RMSE": rmse, "MAE": mae, "MAPE (%)": mape, "R2": r2}
-
-
-def compute_bayesian_coverage(y_true, lower, upper) -> dict:
-    """
-    Pour un modele fournissant un intervalle (Bayesien ou GLM Poisson) :
-        - couverture : % des vraies valeurs effectivement dans [lower, upper]
-          (cible ~95% si l'intervalle est a 95%)
-        - largeur moyenne de l'intervalle (plus c'est etroit, mieux c'est,
-          a couverture egale)
-    """
+def compute_interval_metrics(y_true, lower, upper) -> dict:
+    """Part des valeurs réelles dans l'intervalle (cible : 95 %) et largeur moyenne."""
     y_true = np.asarray(y_true, dtype=float)
     lower = np.asarray(lower, dtype=float)
     upper = np.asarray(upper, dtype=float)
-    inside = (y_true >= lower) & (y_true <= upper)
     return {
-        "Couverture IC95% (%)": float(np.mean(inside) * 100),
+        "Couverture IC95% (%)": float(np.mean((y_true >= lower) & (y_true <= upper)) * 100),
         "Largeur moyenne IC": float(np.mean(upper - lower)),
     }
 
 
-def evaluate_model(model: BaseForecastModel, train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+def noise_limits(y_true, expected) -> dict:
     """
-    Entraine un modele sur train_df, predit sur test_df et retourne un
-    dictionnaire pret a etre affiche : metriques + (si applicable)
-    couverture de l'intervalle + les predictions elles-memes (pour trace).
+    Meilleur score atteignable si `expected` était le vrai rythme d'appels : un
+    comptage de Poisson s'en écarte par simple hasard, de façon imprévisible.
     """
-    model.fit(train_df)
-    result = model.predict(test_df, extra_history=train_df[["date", "heure_debut", "volume"]])
-    y_true = test_df["volume"].values
-    metrics = compute_metrics(y_true, result.pred_mean)
-
-    has_interval = result.pred_lower is not None and not np.all(np.isnan(result.pred_lower))
-    if has_interval:
-        metrics.update(compute_bayesian_coverage(y_true, result.pred_lower, result.pred_upper))
-
+    y_true = np.asarray(y_true, dtype=float)
+    mu = np.clip(np.asarray(expected, dtype=float), 1e-9, None)
+    mode = np.floor(mu)
+    mean_abs_dev = 2 * (mode + 1) * stats.poisson.pmf(mode + 1, mu)  # E|X - mu| exact
+    variance = y_true.var()
     return {
-        "model": model,
-        "metrics": metrics,
-        "predictions": result.as_dataframe(),
-        "has_interval": has_interval,
+        "RMSE": float(np.sqrt(mu.mean())),
+        "MAE": float(mean_abs_dev.mean()),
+        "WAPE (%)": float(mean_abs_dev.sum() / y_true.sum() * 100) if y_true.sum() else np.nan,
+        "R2": float(1 - mu.mean() / variance) if variance > 0 else np.nan,
     }
 
 
-# ---------------------------------------------------------------------------
-# Recommandation de staffing
-# ---------------------------------------------------------------------------
-
-@dataclass
-class StaffingRecommendation:
-    agents_base: int
-    agents_recommandes: int
-    attente_estimee_sec: float
-    taux_decroche_estime: float
-    depasse_max_agents: bool
-
-
-def recommend_staffing(
-    volume_pred: float,
-    dmt_moyenne_sec: float,
-    attente_historique_sec: float,
-    decroche_historique: float,
-    slot_duration_sec: float = 3600.0,
-    seuil_attente_sec: float = 20.0,
-    seuil_decroche: float = 0.05,
-    max_agents: int = 20,
-) -> StaffingRecommendation:
+def walk_forward_evaluate(model_cls, agg: pd.DataFrame, test_days: int = 14, n_folds: int = 3) -> dict:
     """
-    Calcule le nombre d'agents recommande pour une tranche horaire donnee.
-
-    Etape 1 (charge de travail) :
-        agents_base = CEIL( (volume_pred * dmt_moyenne_sec) / slot_duration_sec )
-        -> nombre d'agents necessaires pour ecouler la charge de travail
-           totale (en "secondes-agent") sur la duree de la tranche.
-
-    Etape 2 (ajustement qualite de service) :
-        On suppose que l'attente moyenne et le taux de decroche observes
-        historiquement evoluent (approximativement) en proportion inverse
-        du nombre d'agents par rapport au besoin theorique de base :
-            attente_estimee(N)  = attente_historique * (agents_base / N)
-            decroche_estime(N)  = decroche_historique * (agents_base / N)
-        C'est une approximation simple (lineaire) de l'effet du
-        sureffectif/sous-effectif sur la qualite de service -- une vraie
-        modelisation de file d'attente (loi d'Erlang C) serait plus precise
-        mais sort du cadre de ce prototype.
-        On augmente N tant que l'un des deux seuils n'est pas respecte,
-        jusqu'a max_agents.
-
-    Returns
-    -------
-    StaffingRecommendation
+    Validation glissante : le modèle est réentraîné à plusieurs dates de coupure et
+    testé sur les `test_days` jours suivants. Il n'utilise jamais de données futures.
+    Le score ne dépend pas d'une seule quinzaine de test, parfois favorable.
     """
-    agents_base = max(1, math.ceil((volume_pred * dmt_moyenne_sec) / slot_duration_sec))
+    last_date = agg["date"].max()
+    tests, predictions = [], []
+    for fold in reversed(range(n_folds)):
+        end = last_date - pd.Timedelta(days=test_days * fold)
+        cutoff = end - pd.Timedelta(days=test_days)
+        train = agg[agg["date"] <= cutoff]
+        test = agg[(agg["date"] > cutoff) & (agg["date"] <= end)]
+        if train["date"].nunique() < 21 or test.empty:
+            continue
+        model = model_cls().fit(train)
+        predictions.append(model.predict(test).as_dataframe())
+        tests.append(test)
 
-    n = agents_base
-    while n <= max_agents:
-        ratio = agents_base / n
-        attente_est = attente_historique_sec * ratio
-        decroche_est = decroche_historique * ratio
-        if attente_est <= seuil_attente_sec and decroche_est <= seuil_decroche:
-            break
-        n += 1
+    if not tests:
+        raise ValueError("Historique trop court : réduisez le nombre de jours de test ou de replis.")
 
-    depasse = n > max_agents
-    n_final = min(n, max_agents)
-    ratio_final = agents_base / n_final if n_final else 1.0
-
-    return StaffingRecommendation(
-        agents_base=agents_base,
-        agents_recommandes=n_final,
-        attente_estimee_sec=round(attente_historique_sec * ratio_final, 1),
-        taux_decroche_estime=round(min(decroche_historique * ratio_final, 1.0), 4),
-        depasse_max_agents=depasse,
-    )
-
-
-def estimate_future_dmt_and_quality(
-    agg: pd.DataFrame, future_df: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Pour chaque ligne de future_df (date, heure_debut, jour_semaine),
-    estime la DMT moyenne, l'attente moyenne et le taux de decroche
-    "attendus" en se basant sur la moyenne historique du meme couple
-    (jour_semaine, heure_debut). A defaut d'historique pour ce couple
-    precis, on retombe sur la moyenne globale du slot, puis sur la
-    moyenne globale generale.
-    """
-    by_slot_day = agg.groupby(["jour_semaine", "heure_debut"]).agg(
-        dmt_moyenne=("dmt_moyenne", "mean"),
-        attente_moyenne=("attente_moyenne", "mean"),
-        taux_decroche=("taux_decroche", "mean"),
-    )
-    by_slot = agg.groupby("heure_debut").agg(
-        dmt_moyenne=("dmt_moyenne", "mean"),
-        attente_moyenne=("attente_moyenne", "mean"),
-        taux_decroche=("taux_decroche", "mean"),
-    )
-    global_means = agg[["dmt_moyenne", "attente_moyenne", "taux_decroche"]].mean()
-
-    rows = []
-    for _, row in future_df.iterrows():
-        key = (row["jour_semaine"], row["heure_debut"])
-        if key in by_slot_day.index:
-            vals = by_slot_day.loc[key]
-        elif row["heure_debut"] in by_slot.index:
-            vals = by_slot.loc[row["heure_debut"]]
-        else:
-            vals = global_means
-        rows.append({
-            "dmt_moyenne": float(vals["dmt_moyenne"]),
-            "attente_moyenne": float(vals["attente_moyenne"]),
-            "taux_decroche": float(vals["taux_decroche"]),
-        })
-    return pd.DataFrame(rows)
+    test_df = pd.concat(tests, ignore_index=True)
+    predictions_df = pd.concat(predictions, ignore_index=True)
+    y_true = test_df["volume"].to_numpy()
+    metrics = compute_metrics(y_true, predictions_df["pred_mean"], test_df["date"])
+    metrics.update(compute_interval_metrics(y_true, predictions_df["pred_lower"], predictions_df["pred_upper"]))
+    return {
+        "metrics": metrics,
+        "predictions": predictions_df,
+        "test_df": test_df,
+        "n_folds": len(tests),
+        "diagnostics": getattr(model, "diagnostics", {}),
+    }

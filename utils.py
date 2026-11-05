@@ -1,33 +1,31 @@
 """
 utils.py
 ========
-Fonctions de pretraitement, d'agregation et de validation statistique
-pour l'application de prevision des appels et de recommandation de staffing.
+Fonctions de prétraitement, d'agrégation et de validation statistique
+pour l'application de prévision des appels et de recommandation de staffing.
 
-Toutes les fonctions sont documentees (docstrings) et concues pour etre
-appelees independamment de Streamlit, ce qui permet de les tester
-unitairement (voir tests/test_utils.py).
+Les fonctions sont indépendantes de Streamlit et testées dans tests/.
 
-Colonnes attendues dans le CSV d'entree (voir README.md) :
+Colonnes attendues dans le CSV d'entrée (voir README.md) :
     - id_appel             : identifiant unique de l'appel
     - date_heure           : date et heure de l'appel (parsable par pandas)
     - statut               : "repondu" ou "non_repondu"
     - post_appel           : temps de post-appel, en secondes
-    - temps_communication  : duree de la conversation, en secondes
+    - temps_communication  : durée de la conversation, en secondes
     - temps_attente        : temps d'attente avant prise d'appel, en secondes
-    - id_agent             : identifiant de l'agent ayant traite l'appel
-                              (peut etre vide si statut == "non_repondu")
+    - id_agent             : identifiant de l'agent ayant traité l'appel
+                              (peut être vide si statut == "non_repondu")
 """
 
 from __future__ import annotations
 
-import io
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+from statsmodels.stats.multitest import multipletests
 
 try:
     import holidays as holidays_lib
@@ -59,7 +57,7 @@ JOURS_SEMAINE_FR = [
 
 @dataclass
 class ValidationResult:
-    """Resultat de la validation d'un fichier CSV importe."""
+    """Résultat de la validation d'un fichier CSV importé."""
     is_valid: bool
     missing_columns: list
     n_rows: int
@@ -79,7 +77,7 @@ def load_calls_csv(file_or_buffer) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Donnees brutes, avec date_heure converti en datetime.
+        Données brutes, avec date_heure converti en datetime.
     """
     df = pd.read_csv(file_or_buffer)
     df.columns = [c.strip().lower() for c in df.columns]
@@ -90,9 +88,9 @@ def load_calls_csv(file_or_buffer) -> pd.DataFrame:
 
 def validate_calls_dataframe(df: pd.DataFrame) -> ValidationResult:
     """
-    Verifie que le DataFrame contient les colonnes requises et des dates
-    valides. Ne leve pas d'exception : retourne un rapport structure pour
-    affichage cote interface (utile pour un public non technique).
+    Vérifie que le DataFrame contient les colonnes requises et des dates
+    valides. Ne lève pas d'exception : retourne un rapport structuré pour
+    affichage côté interface (utile pour un public non technique).
     """
     warnings = []
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
@@ -130,9 +128,16 @@ def validate_calls_dataframe(df: pd.DataFrame) -> ValidationResult:
 # Features temporelles et tranches horaires
 # ---------------------------------------------------------------------------
 
+def hour_label(heure: float) -> str:
+    """Libellé court d'une heure de début : 8 -> '8h', 8.5 -> '8h30'."""
+    h = int(heure)
+    minutes = int(round((heure - h) * 60))
+    return f"{h}h" if minutes == 0 else f"{h}h{minutes:02d}"
+
+
 def time_slot_label(dt: pd.Timestamp, slot_minutes: int = 60) -> str:
     """
-    Construit le libelle d'une tranche horaire, ex: '2026-06-28_8h-9h'
+    Construit le libellé d'une tranche horaire, ex: '2026-06-28_8h-9h'
     pour slot_minutes=60, ou '2026-06-28_8h00-8h30' pour slot_minutes=30.
     """
     minute_of_day = dt.hour * 60 + dt.minute
@@ -150,19 +155,18 @@ def time_slot_label(dt: pd.Timestamp, slot_minutes: int = 60) -> str:
 
 def add_time_features(df: pd.DataFrame, slot_minutes: int = 60) -> pd.DataFrame:
     """
-    Ajoute les colonnes temporelles necessaires a l'agregation :
-    date, heure_debut (int, debut de tranche en heures), tranche (label),
+    Ajoute les colonnes temporelles nécessaires a l'agrégation :
+    date, heure_début (début de tranche en heures, 8.5 = 8h30), tranche (label),
     jour_semaine (nom FR), jour_semaine_num (0=Lundi), semaine, mois.
 
-    Les lignes dont date_heure est invalide (NaT) sont supprimees.
+    Les lignes dont date_heure est invalide (NaT) sont supprimées.
     """
     out = df.copy()
     out = out.dropna(subset=["date_heure"])
     out["date"] = out["date_heure"].dt.date.astype(str)
     minute_of_day = out["date_heure"].dt.hour * 60 + out["date_heure"].dt.minute
     slot_index = (minute_of_day // slot_minutes).astype(int)
-    out["heure_debut"] = (slot_index * slot_minutes) // 60
-    out["minute_debut"] = (slot_index * slot_minutes) % 60
+    out["heure_debut"] = (slot_index * slot_minutes) / 60  # 8.5 = 8h30
     out["tranche"] = out["date_heure"].apply(
         lambda d: time_slot_label(d, slot_minutes=slot_minutes)
     )
@@ -180,14 +184,14 @@ def filter_holidays(
     custom_holidays: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """
-    Marque (colonne 'est_ferie') et, si exclude=True, retire les appels
-    tombant un jour ferie.
+    Marque (colonne 'est_férié') et, si exclude=True, retire les appels
+    tombant un jour férié.
 
     Parameters
     ----------
     country : code pays utilise par la librairie `holidays` (ex: "FR").
     custom_holidays : liste optionnelle de dates "YYYY-MM-DD" a traiter
-        comme feries en plus de celles calculees automatiquement (utile
+        comme fériés en plus de celles calculées automatiquement (utile
         pour des fermetures internes/ponts d'entreprise).
     """
     out = df.copy()
@@ -214,74 +218,99 @@ def filter_holidays(
 
 
 # ---------------------------------------------------------------------------
-# Agregation par date + tranche horaire
+# Agrégation par date + tranche horaire
 # ---------------------------------------------------------------------------
 
 def aggregate_by_slot(
     df: pd.DataFrame,
     wait_threshold_sec: float = 20.0,
+    slot_minutes: int = 60,
 ) -> pd.DataFrame:
     """
-    Agrege les appels par (date, tranche) et calcule les indicateurs
-    necessaires a la prevision et au staffing.
+    Agrège les appels par (date, tranche). Le DataFrame doit être passé par
+    `add_time_features`.
 
-    Le DataFrame en entree doit deja avoir passe `add_time_features`.
+    Chaque tranche d'ouverture apparaît, même sans aucun appel (volume = 0) :
+    retirer ces zéros biaiserait les moyennes vers le haut.
 
-    Indicateurs calcules par groupe (date, tranche) :
-        - volume               : nombre total d'appels
-        - n_repondu / n_non_repondu
-        - taux_decroche        : % d'appels non repondus OU repondus avec
-                                  un temps d'attente > wait_threshold_sec
-        - attente_moyenne      : temps d'attente moyen (secondes)
-        - dmt_moyenne          : (post_appel + temps_communication +
-                                  temps_attente) moyen, secondes
-        - jour_semaine, jour_semaine_num, heure_debut, semaine, mois :
-          reportes depuis le groupe (constants au sein d'une tranche)
+    Indicateurs par tranche :
+        - volume : appels reçus
+        - n_repondu, n_abandonne, n_dans_delai
+        - taux_abandon : part des appels reçus puis abandonnés
+        - niveau_service : part des appels reçus, pris en moins de
+          `wait_threshold_sec` secondes
+        - attente_moyenne : attente moyenne des appels répondus (secondes)
+        - dmt_moyenne : temps de communication + post-appel des appels répondus.
+          L'attente n'en fait pas partie, car un agent ne travaille pas pendant
+          qu'un appelant patiente.
     """
+    columns = [
+        "date", "tranche", "heure_debut", "jour_semaine", "jour_semaine_num", "semaine", "mois",
+        "volume", "n_repondu", "n_abandonne", "n_dans_delai", "taux_abandon", "niveau_service",
+        "attente_moyenne", "dmt_moyenne",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
     work = df.copy()
-    work["est_non_decroche"] = (work["statut"] == STATUT_NON_REPONDU) | (
-        (work["statut"] == STATUT_REPONDU) & (work["temps_attente"] > wait_threshold_sec)
-    )
-    work["dmt_appel"] = (
-        work["post_appel"].fillna(0)
-        + work["temps_communication"].fillna(0)
-        + work["temps_attente"].fillna(0)
-    )
+    repondu = work["statut"] == STATUT_REPONDU
+    work["_repondu"] = repondu
+    work["_abandonne"] = work["statut"] == STATUT_NON_REPONDU
+    work["_dans_delai"] = repondu & (work["temps_attente"] <= wait_threshold_sec)
+    work["_attente"] = work["temps_attente"].where(repondu)
+    work["_dmt"] = (work["post_appel"].fillna(0) + work["temps_communication"].fillna(0)).where(repondu)
 
-    group_cols = ["date", "tranche"]
-    agg = work.groupby(group_cols).agg(
+    observed = work.groupby(["date", "heure_debut"]).agg(
         volume=("id_appel", "count"),
-        n_repondu=("statut", lambda s: (s == STATUT_REPONDU).sum()),
-        n_non_repondu=("statut", lambda s: (s == STATUT_NON_REPONDU).sum()),
-        n_non_decroche=("est_non_decroche", "sum"),
-        attente_moyenne=("temps_attente", "mean"),
-        dmt_moyenne=("dmt_appel", "mean"),
-        jour_semaine=("jour_semaine", "first"),
-        jour_semaine_num=("jour_semaine_num", "first"),
-        heure_debut=("heure_debut", "first"),
-        semaine=("semaine", "first"),
-        mois=("mois", "first"),
-    ).reset_index()
+        n_repondu=("_repondu", "sum"),
+        n_abandonne=("_abandonne", "sum"),
+        n_dans_delai=("_dans_delai", "sum"),
+        attente_moyenne=("_attente", "mean"),
+        dmt_moyenne=("_dmt", "mean"),
+    )
 
-    agg["taux_decroche"] = agg["n_non_decroche"] / agg["volume"]
-    agg = agg.drop(columns=["n_non_decroche"])
+    grid = pd.MultiIndex.from_product(
+        [sorted(work["date"].unique()), sorted(work["heure_debut"].unique())],
+        names=["date", "heure_debut"],
+    )
+    agg = observed.reindex(grid).reset_index()
+    counts = ["volume", "n_repondu", "n_abandonne", "n_dans_delai"]
+    agg[counts] = agg[counts].fillna(0).astype(int)
+
     agg["date"] = pd.to_datetime(agg["date"])
-    agg = agg.sort_values(["date", "heure_debut"]).reset_index(drop=True)
-    return agg
+    agg["jour_semaine_num"] = agg["date"].dt.weekday
+    agg["jour_semaine"] = agg["jour_semaine_num"].map(lambda i: JOURS_SEMAINE_FR[i])
+    agg["semaine"] = agg["date"].dt.isocalendar().week.astype(int)
+    agg["mois"] = agg["date"].dt.month
+    starts = agg["date"] + pd.to_timedelta(agg["heure_debut"], unit="h")
+    agg["tranche"] = [time_slot_label(start, slot_minutes) for start in starts]
+
+    received = agg["volume"].where(agg["volume"] > 0)
+    agg["taux_abandon"] = agg["n_abandonne"] / received
+    agg["niveau_service"] = agg["n_dans_delai"] / received
+    return agg[columns].sort_values(["date", "heure_debut"]).reset_index(drop=True)
+
+
+def kpi_summary(agg: pd.DataFrame) -> dict:
+    """KPI globaux, pondérés par les volumes (pas une moyenne de moyennes)."""
+    volume = agg["volume"].sum()
+    answered = agg["n_repondu"].sum()
+    if volume == 0:
+        return {"volume": 0, "taux_abandon": np.nan, "niveau_service": np.nan,
+                "dmt_moyenne": np.nan, "attente_moyenne": np.nan}
+    return {
+        "volume": int(volume),
+        "taux_abandon": agg["n_abandonne"].sum() / volume,
+        "niveau_service": agg["n_dans_delai"].sum() / volume,
+        "dmt_moyenne": (agg["dmt_moyenne"] * agg["n_repondu"]).sum() / answered if answered else np.nan,
+        "attente_moyenne": (agg["attente_moyenne"] * agg["n_repondu"]).sum() / answered if answered else np.nan,
+    }
 
 
 def dmt_by_agent(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calcule la DMT moyenne par agent et par date (pour suivre son
-    evolution dans le temps, ex: amelioration progressive).
-    Les appels non repondus (id_agent vide) sont exclus.
-    """
+    """DMT moyenne par agent et par date, appels répondus uniquement."""
     work = df[df["statut"] == STATUT_REPONDU].copy()
-    work["dmt_appel"] = (
-        work["post_appel"].fillna(0)
-        + work["temps_communication"].fillna(0)
-        + work["temps_attente"].fillna(0)
-    )
+    work["dmt_appel"] = work["post_appel"].fillna(0) + work["temps_communication"].fillna(0)
     out = work.groupby(["id_agent", "date"]).agg(
         dmt_moyenne=("dmt_appel", "mean"),
         n_appels=("id_appel", "count"),
@@ -314,13 +343,9 @@ def filter_by_agent_and_date(
 
 def lambda_table(agg: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcule, pour chaque (jour_semaine, heure_debut), la moyenne (lambda)
-    et la variance du volume d'appels observe sur l'historique, ainsi
-    que le nombre d'observations (n_dates).
-
-    Pour une vraie distribution de Poisson, moyenne ~ variance : on
-    calcule donc aussi le ratio variance/moyenne (proche de 1 = bon signe,
-    largement > 1 = sur-dispersion frequente avec des appels en pratique).
+    Moyenne (lambda), variance et nombre d'observations du volume pour chaque
+    (jour_semaine, heure_début). Sous une loi de Poisson, le ratio
+    variance/moyenne vaut environ 1 ; au-dessus, on parle de sur-dispersion.
     """
     table = agg.groupby(["jour_semaine", "jour_semaine_num", "heure_debut"]).agg(
         lambda_=("volume", "mean"),
@@ -334,111 +359,88 @@ def lambda_table(agg: pd.DataFrame) -> pd.DataFrame:
     return table.reset_index(drop=True)
 
 
-def poisson_chi2_test(observed_counts: np.ndarray, lam: float, n_bins: int = 8):
+def dispersion_test(counts: np.ndarray, alpha: float = 0.05) -> dict:
     """
-    Test du Chi2 d'adequation entre les comptages observes et une loi de
-    Poisson(lam). Regroupe les valeurs en classes (bins) pour respecter
-    les conditions de validite du test (effectifs attendus suffisants).
+    Test de dispersion : sous une loi de Poisson, (n - 1) * variance / moyenne
+    suit un Chi2 à n - 1 degrés de liberte. Le test est unilatéral, car c'est la
+    sur-dispersion qui ferait sous-estimer les pics d'appels.
 
-    Returns
-    -------
-    dict avec 'chi2_stat', 'p_value', 'ddl', 'valide' (bool : test jugeable),
-    et un message d'interpretation en francais.
+    Sur une seule tranche, il n'y a qu'une douzaine d'observations : ne pas
+    rejeter ne prouve donc rien. `pooled_dispersion_test` est bien plus puissant.
     """
-    observed_counts = np.asarray(observed_counts)
-    observed_counts = observed_counts[~np.isnan(observed_counts)]
-    n = len(observed_counts)
+    counts = np.asarray(counts, dtype=float)
+    counts = counts[~np.isnan(counts)]
+    n, mean = len(counts), counts.mean() if len(counts) else 0.0
 
-    if n < 5 or lam <= 0:
+    if n < 5 or mean <= 0:
         return {
-            "chi2_stat": np.nan,
-            "p_value": np.nan,
-            "ddl": 0,
-            "valide": False,
-            "message": "Pas assez d'observations pour realiser un test fiable.",
+            "ratio": np.nan, "p_value": np.nan, "valide": False,
+            "message": "Pas assez d'observations pour réaliser un test fiable.",
         }
 
-    max_k = int(max(observed_counts.max(), stats.poisson.ppf(0.999, lam)))
-    edges = np.unique(
-        np.clip(np.linspace(0, max_k + 1, num=min(n_bins, max_k + 2) + 1), 0, max_k + 1)
-    ).astype(int)
-    if len(edges) < 3:
-        edges = np.array([0, max_k // 2 + 1, max_k + 1])
-
-    observed_hist, _ = np.histogram(observed_counts, bins=edges)
-    expected_probs = np.diff(stats.poisson.cdf(edges - 1, lam))
-    expected_probs[-1] += 1 - expected_probs.sum()  # capter la queue de distribution
-    expected_counts = expected_probs * n
-
-    # Fusionner les classes dont l'effectif attendu est trop faible (<5)
-    obs_merged, exp_merged = [], []
-    obs_buf, exp_buf = 0.0, 0.0
-    for o, e in zip(observed_hist, expected_counts):
-        obs_buf += o
-        exp_buf += e
-        if exp_buf >= 5:
-            obs_merged.append(obs_buf)
-            exp_merged.append(exp_buf)
-            obs_buf, exp_buf = 0.0, 0.0
-    if exp_buf > 0:
-        if exp_merged:
-            obs_merged[-1] += obs_buf
-            exp_merged[-1] += exp_buf
-        else:
-            obs_merged.append(obs_buf)
-            exp_merged.append(exp_buf)
-
-    if len(obs_merged) < 2:
-        return {
-            "chi2_stat": np.nan,
-            "p_value": np.nan,
-            "ddl": 0,
-            "valide": False,
-            "message": "Pas assez de classes avec un effectif suffisant pour ce test.",
-        }
-
-    obs_merged = np.array(obs_merged)
-    exp_merged = np.array(exp_merged) * (obs_merged.sum() / np.array(exp_merged).sum())
-    ddl = max(len(obs_merged) - 1 - 1, 1)  # -1 pour le total, -1 car lambda estime
-    chi2_stat, p_value = stats.chisquare(obs_merged, exp_merged, ddof=max(ddl - (len(obs_merged) - 1), 0))
-
-    if p_value > 0.05:
+    ratio = counts.var(ddof=1) / mean
+    p_value = float(stats.chi2.sf((n - 1) * ratio, n - 1))
+    if p_value < alpha:
         message = (
-            f"p-value = {p_value:.3f} (> 0.05) : on ne peut PAS rejeter "
-            "l'hypothese de Poisson. Vos donnees sont compatibles avec "
-            f"une loi de Poisson(lambda={lam:.1f})."
+            f"p-value = {p_value:.3f} : sur-dispersion détectée (variance = {ratio:.2f} × moyenne). "
+            "Les pics sont plus forts que ce que prévoit une loi de Poisson."
         )
     else:
         message = (
-            f"p-value = {p_value:.3f} (<= 0.05) : l'hypothese de Poisson "
-            "est rejetee pour ce groupe. La variance observee s'ecarte "
-            "trop de la moyenne (souvent un signe de sur-dispersion)."
+            f"p-value = {p_value:.3f} : pas de sur-dispersion détectée sur cette tranche, "
+            f"mais avec {n} observations seulement, ce test isolé a peu de puissance."
         )
+    return {"ratio": float(ratio), "p_value": p_value, "valide": True, "message": message}
 
-    return {
-        "chi2_stat": float(chi2_stat),
-        "p_value": float(p_value),
-        "ddl": int(ddl),
-        "valide": True,
-        "message": message,
-    }
+
+def pooled_dispersion_test(agg: pd.DataFrame, min_lambda: float = 1.0, alpha: float = 0.05) -> dict:
+    """
+    Test de dispersion regroupant toutes les tranches (jour x heure) : chacune
+    garde sa propre moyenne, mais leurs écarts sont additionnés. C'est le test à
+    regarder pour décider si le modèle de Poisson convient.
+    """
+    grouped = agg.groupby(["jour_semaine_num", "heure_debut"])["volume"]
+    stat, ddl, n_groupes = 0.0, 0, 0
+    for _, counts in grouped:
+        mean = counts.mean()
+        if len(counts) < 2 or mean < min_lambda:
+            continue
+        stat += ((counts - mean) ** 2).sum() / mean
+        ddl += len(counts) - 1
+        n_groupes += 1
+
+    if ddl == 0:
+        return {
+            "ratio": np.nan, "p_value": np.nan, "n_groupes": 0, "valide": False,
+            "message": "Pas assez d'observations pour réaliser le test global.",
+        }
+
+    ratio = stat / ddl
+    p_value = float(stats.chi2.sf(stat, ddl))
+    if p_value < alpha:
+        message = (
+            f"Sur-dispersion détectée (ratio {ratio:.2f}, p-value = {p_value:.4f}) : la variance "
+            "dépasse la moyenne, les intervalles de Poisson seraient trop étroits."
+        )
+    else:
+        message = (
+            f"Aucune sur-dispersion détectée sur {n_groupes} tranches "
+            f"(ratio {ratio:.2f}, p-value = {p_value:.3f}) : le modèle de Poisson est adapté."
+        )
+    return {"ratio": float(ratio), "p_value": p_value, "n_groupes": n_groupes,
+            "valide": True, "message": message}
 
 
 def poisson_validation_report(agg: pd.DataFrame) -> pd.DataFrame:
     """
-    Construit un rapport complet (1 ligne par jour_semaine x heure_debut) :
-    lambda, variance, ratio, et resultat du test du Chi2.
-
-    Retourne un DataFrame pret a etre affiche dans Streamlit.
+    Rapport par (jour_semaine, heure_début). `p_ajustee` corrige les comparaisons
+    multiples (Benjamini-Hochberg) : sur 77 tranches, environ 4 auraient sinon
+    une p-value < 0.05 par simple hasard.
     """
-    lam_table = lambda_table(agg)
     rows = []
-    for _, row in lam_table.iterrows():
-        mask = (agg["jour_semaine"] == row["jour_semaine"]) & (
-            agg["heure_debut"] == row["heure_debut"]
-        )
-        observed = agg.loc[mask, "volume"].values
-        test_result = poisson_chi2_test(observed, row["lambda_"])
+    for _, row in lambda_table(agg).iterrows():
+        mask = (agg["jour_semaine"] == row["jour_semaine"]) & (agg["heure_debut"] == row["heure_debut"])
+        result = dispersion_test(agg.loc[mask, "volume"].values)
         rows.append({
             "jour_semaine": row["jour_semaine"],
             "heure_debut": row["heure_debut"],
@@ -446,14 +448,18 @@ def poisson_validation_report(agg: pd.DataFrame) -> pd.DataFrame:
             "variance": round(row["variance"], 2) if pd.notna(row["variance"]) else np.nan,
             "ratio_var_moyenne": round(row["ratio_var_moyenne"], 2) if pd.notna(row["ratio_var_moyenne"]) else np.nan,
             "n_observations": int(row["n_observations"]),
-            "p_value": round(test_result["p_value"], 4) if test_result["valide"] else np.nan,
-            "conclusion": test_result["message"],
+            "p_value": result["p_value"],
         })
-    return pd.DataFrame(rows)
+    report = pd.DataFrame(rows)
+    report["p_ajustee"] = np.nan
+    valid = report["p_value"].notna()
+    if valid.any():
+        report.loc[valid, "p_ajustee"] = multipletests(report.loc[valid, "p_value"], method="fdr_bh")[1]
+    return report.round({"p_value": 4, "p_ajustee": 4})
 
 
 def poisson_pmf_curve(lam: float, k_max: Optional[int] = None) -> pd.DataFrame:
-    """Retourne les points (k, P(X=k)) de la loi de Poisson(lam) pour le trace graphique."""
+    """Retourne les points (k, P(X=k)) de la loi de Poisson(lam) pour le tracé graphique."""
     if k_max is None:
         k_max = max(int(stats.poisson.ppf(0.999, lam)) + 1, 5)
     ks = np.arange(0, k_max + 1)
@@ -462,7 +468,7 @@ def poisson_pmf_curve(lam: float, k_max: Optional[int] = None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Construction du squelette de previsions futures
+# Construction du squelette de prévisions futures
 # ---------------------------------------------------------------------------
 
 def build_future_skeleton(
@@ -473,17 +479,18 @@ def build_future_skeleton(
     exclude_holidays: bool = True,
     include_weekends: bool = True,
     custom_holidays: Optional[Sequence[str]] = None,
+    slot_minutes: int = 60,
 ) -> pd.DataFrame:
     """
-    Construit le calendrier (date x tranche horaire) a prevoir pour les
+    Construit le calendrier (date x tranche horaire) à prévoir pour les
     `horizon_days` jours suivant `last_date`.
 
     Returns
     -------
-    pd.DataFrame avec les colonnes : date, heure_debut, tranche,
-    jour_semaine, jour_semaine_num (memes conventions que `add_time_features`
-    / `aggregate_by_slot`, ce qui permet de reutiliser directement les
-    modeles de `models.py`).
+    pd.DataFrame avec les colonnes : date, heure_début, tranche,
+    jour_semaine, jour_semaine_num (mêmes conventions que `add_time_features`
+    / `aggregate_by_slot`, ce qui permet de réutiliser directement les
+    modèles de `models.py`).
     """
     future_dates = pd.date_range(
         pd.to_datetime(last_date) + pd.Timedelta(days=1), periods=horizon_days, freq="D"
@@ -512,7 +519,7 @@ def build_future_skeleton(
             rows.append({
                 "date": pd.Timestamp(d),
                 "heure_debut": slot,
-                "tranche": f"{d.strftime('%Y-%m-%d')}_{slot}h-{slot + 1}h",
+                "tranche": time_slot_label(pd.Timestamp(d) + pd.Timedelta(hours=float(slot)), slot_minutes),
                 "jour_semaine": JOURS_SEMAINE_FR[d.weekday()],
                 "jour_semaine_num": d.weekday(),
             })
